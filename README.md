@@ -192,6 +192,17 @@ Sample point: 82.4%
 StdFiltersNbr: 4
 ```
 
+Bench e-stop setting:
+
+```c
+#define ESTOP_INPUT_ENABLED 0
+```
+
+The default is `0` because the e-stop circuit is not wired yet. In this mode the
+firmware keeps PD2 pulled high, disables the EXTI2 interrupt, and does not latch
+a false e-stop from an unwired connector. Set this to `1` before real driving
+tests, after the active-low e-stop circuit is connected to PD2.
+
 Build and flash the STM32 board from STM32CubeIDE. After flashing, the board
 should publish `0x131` and `0x122` periodically at about 20 ms.
 

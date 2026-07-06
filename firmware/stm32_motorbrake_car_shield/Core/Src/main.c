@@ -153,7 +153,12 @@
 #define BTN_TOGGLE_Pin        GPIO_PIN_1
 #define BTN_TOGGLE_GPIO_Port  GPIOC
 
-/* E-Stop on PD2: active-low with pull-up (idle HIGH, triggered LOW -> falling). */
+/* E-Stop on PD2: active-low with pull-up (idle HIGH, triggered LOW -> falling).
+ * Bench mode note:
+ *   0 = e-stop circuit is not wired yet; ignore PD2 e-stop input.
+ *   1 = real vehicle mode; PD2 falling edge latches watchdog_status=1.
+ * Keep this at 0 only for bench testing. Set it to 1 before driving tests. */
+#define ESTOP_INPUT_ENABLED    0
 #define ESTOP_Pin             GPIO_PIN_2
 #define ESTOP_GPIO_Port       GPIOD
 /* USER CODE END PD */
@@ -316,18 +321,29 @@ int main(void)
 
 	/* E-Stop (PD2): CubeMX generates this EXTI pin as GPIO_NOPULL, which leaves
 	 * the active-low line floating and fires spurious falling edges -> false
-	 * watchdog_status=1. Re-init with internal pull-up (USER CODE = regen-safe)
-	 * and drop any edge latched during boot/re-config before we start. */
+	 * watchdog_status=1. Re-init here (USER CODE = regen-safe). */
 	GPIO_InitTypeDef estop_init = {0};
 	__HAL_RCC_GPIOD_CLK_ENABLE();
 	estop_init.Pin = ESTOP_Pin;
+#if ESTOP_INPUT_ENABLED
 	estop_init.Mode = GPIO_MODE_IT_FALLING;
 	estop_init.Pull = GPIO_PULLUP;
 	estop_init.Speed = GPIO_SPEED_FREQ_LOW;
 	HAL_GPIO_Init(ESTOP_GPIO_Port, &estop_init);
 	__HAL_GPIO_EXTI_CLEAR_IT(ESTOP_Pin);
 	HAL_NVIC_ClearPendingIRQ(EXTI2_IRQn);
-	watchdog_status = 0;            // clear false latch from a floating boot edge
+#else
+	/* Bench-only bypass: keep the pin pulled high and disable EXTI2 so an
+	 * unwired e-stop connector cannot latch a false fault. */
+	estop_init.Mode = GPIO_MODE_INPUT;
+	estop_init.Pull = GPIO_PULLUP;
+	estop_init.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(ESTOP_GPIO_Port, &estop_init);
+	__HAL_GPIO_EXTI_CLEAR_IT(ESTOP_Pin);
+	HAL_NVIC_ClearPendingIRQ(EXTI2_IRQn);
+	HAL_NVIC_DisableIRQ(EXTI2_IRQn);
+#endif
+	watchdog_status = 0;            // clear false latch from boot/re-config
 
 	/* Recall the start/stop angles saved by the last /servo_command (defaults if
 	 * the flash page was never written). */
@@ -820,8 +836,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if (GPIO_Pin == GPIO_PIN_2) // ตรวจสอบว่าเป็น Interrupt จากขา PD2
+  if (GPIO_Pin == ESTOP_Pin) // ตรวจสอบว่าเป็น Interrupt จากขา PD2
   {
+#if ESTOP_INPUT_ENABLED
     // 0. กรอง glitch: noise ตอนคอยล์ relay สวิตช์ทำให้ PD2 เกิด falling edge ปลอม.
     //    E-Stop จริงจะกดค้างให้สาย LOW ต่อเนื่อง ส่วน glitch จะเด้งกลับ HIGH ทันที.
     //    spin สั้นๆ แล้วอ่านซ้ำ ถ้ากลับเป็น HIGH = glitch -> ไม่ latch.
@@ -840,6 +857,11 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
     // 3. ตั้งสถานะ watchdog ให้เป็น Triggered เพื่อให้ PC รู้ว่าเกิด E-Stop
     watchdog_status = 1;
+#else
+    /* Bench-only bypass: PD2 e-stop input is intentionally ignored until the
+     * real e-stop circuit is wired and ESTOP_INPUT_ENABLED is set to 1. */
+    __HAL_GPIO_EXTI_CLEAR_IT(ESTOP_Pin);
+#endif
   }
 }
 /* USER CODE END 4 */
