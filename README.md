@@ -236,13 +236,16 @@ E-stop behavior:
 
 ```text
 PD2 active-low, falling edge latches watchdog_status = 1
+PD2 is sampled at boot; if already LOW, watchdog_status is latched immediately
 PD2 is re-initialized with an internal pull-up in USER CODE
-PC13 E_Stop is also reported live in 0x131 bit1 and 0x122 bit6
+PC13 E_Stop is active-low, input pull-up, and reported live in 0x131 bit1 and 0x122 bit6
+ROS /e_stop_status follows the real CAN status bits; startup safety is handled by heartbeat timeout, not by forcing e-stop true.
 ```
 
-If the e-stop circuit is not wired yet, leave PD2 idle high/open so the internal
-pull-up holds it inactive. A real e-stop input should pull PD2 low. Once latched,
-the watchdog/e-stop status is reported in byte 5 of `0x131`.
+Wire the real e-stop so the idle/safe state leaves the input HIGH and an active
+e-stop pulls the input LOW. PD2 is latched in `watchdog_status`; PC13 is a live
+non-latching e-stop input that engages the brake and zeros the speed target
+while active.
 
 Build and flash the STM32 board from STM32CubeIDE. After flashing, the board
 should publish the brake group (`0x131`, `0x133`, `0x134`) and speed group

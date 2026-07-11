@@ -113,8 +113,8 @@ class RosCanBridge(Node):
         # ---------- state ----------
         self.cmd = Twist()
         self.last_cmd_stamp = None          # None = ยังไม่เคยได้ /cmd_vel
-        self.estop_active = True            # เริ่มแบบ fail-safe จนกว่า status จะบอกว่าปกติ
-        self.brake_estop_active = True
+        self.estop_active = False           # ใช้สถานะจริงจาก 0x131/0x122; board_lost ยังเป็น fail-safe ตอนเริ่ม
+        self.brake_estop_active = False
         self.speed_estop_active = False
         self.speed_fault_active = False
         self.last_board_stamp = None

@@ -203,10 +203,9 @@
  * to STOP_ANGLE_DEFAULT, holds the relay closed, and zeroes the speed target.
  * When PC13 releases, the normal relay_cmd / speed command flow resumes. It is
  * also still reported in the status frames (0x131 bit / 0x122 flag).
- * Wiring: PC13 is treated as active-HIGH — a pressed/active E-Stop drives the
- * line HIGH. Flip ESTOP_PC13_ACTIVE_LOW back to 1 if the button is wired
- * active-low (idle HIGH via pull-up, pressed pulls LOW). */
-#define ESTOP_PC13_ACTIVE_LOW 0
+ * Real vehicle wiring is active-low: idle HIGH via pull-up, pressed/open safety
+ * loop pulls LOW. */
+#define ESTOP_PC13_ACTIVE_LOW 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -364,8 +363,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
 	/* E-Stop (PD2): CubeMX generates this EXTI pin as GPIO_NOPULL, which leaves
 	 * the active-low line floating and fires spurious falling edges -> false
-	 * watchdog_status=1. Re-init with internal pull-up (USER CODE = regen-safe)
-	 * and drop any edge latched during boot/re-config before we start. */
+	 * watchdog_status=1. Re-init with internal pull-up (USER CODE = regen-safe),
+	 * clear stale pending edges, then sample the real level so an already-pressed
+	 * e-stop at boot is latched immediately. */
 	GPIO_InitTypeDef estop_init = {0};
 	__HAL_RCC_GPIOD_CLK_ENABLE();
 	estop_init.Pin = ESTOP_Pin;
@@ -375,7 +375,18 @@ int main(void)
 	HAL_GPIO_Init(ESTOP_GPIO_Port, &estop_init);
 	__HAL_GPIO_EXTI_CLEAR_IT(ESTOP_Pin);
 	HAL_NVIC_ClearPendingIRQ(EXTI2_IRQn);
-	watchdog_status = 0;            // clear false latch from a floating boot edge
+	watchdog_status =
+			(HAL_GPIO_ReadPin(ESTOP_GPIO_Port, ESTOP_Pin) == GPIO_PIN_RESET) ? 1u : 0u;
+
+	/* PC13 E_Stop is the live, non-latching e-stop input. Re-init it with an
+	 * internal pull-up so active-low real e-stop wiring has a defined idle level. */
+	GPIO_InitTypeDef pc13_estop_init = {0};
+	__HAL_RCC_GPIOC_CLK_ENABLE();
+	pc13_estop_init.Pin = E_Stop_Pin;
+	pc13_estop_init.Mode = GPIO_MODE_INPUT;
+	pc13_estop_init.Pull = GPIO_PULLUP;
+	pc13_estop_init.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(E_Stop_GPIO_Port, &pc13_estop_init);
 
 	/* Recall the start/stop angles saved by the last /servo_command (defaults if
 	 * the flash page was never written). */
@@ -405,8 +416,8 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 		/* Poll the PC13 E_Stop line first so the brake sequencer and speed loop
-		 * below act on the current level (no one-cycle lag). Active-HIGH by
-		 * default (ESTOP_PC13_ACTIVE_LOW). While active the firmware forces the
+		 * below act on the current level (no one-cycle lag). Active-low real
+		 * e-stop wiring is the default. While active the firmware forces the
 		 * brake engaged (see the sequencer) and commands speed 0; it clears the
 		 * moment the line releases. Also reported in 0x131/0x122. */
 		GPIO_PinState estop_lvl = HAL_GPIO_ReadPin(E_Stop_GPIO_Port, E_Stop_Pin);
