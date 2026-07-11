@@ -27,4 +27,5 @@ steering_node:
     counts_per_deg_neg: 320.0
     enable_period_s: 1.0
     safe_steering_deg: 0.0
-    disable_on_fault: false
+    disable_on_fault: true
+    enable_on_startup: false

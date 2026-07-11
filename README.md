@@ -46,6 +46,8 @@ The user commands the cart only through `/cmd_vel`.
 - `ros_can_bridge` converts yaw rate to steering angle with a bicycle model.
 - `ros_can_bridge` owns speed/brake safety logic.
 - `steering_node` owns KEYA motor command, heartbeat, timeout, and steering fault handling.
+- By default, `steering_node` does not enable the KEYA motor at startup. It waits
+  until `/steering_cmd` is fresh and `/lowlevel_fault` + `/e_stop_status` are clear.
 
 ## CAN Protocol
 
@@ -293,6 +295,8 @@ Steering does not move:
 - Confirm KEYA heartbeat `0x07000001` appears as an extended CAN frame.
 - Confirm `steering_node` is running and `/steering_fault` is false.
 - Confirm `/lowlevel_fault` and `/e_stop_status` are false before expecting steering motion.
+- Confirm `/cmd_vel` is being published continuously; without a fresh command,
+  `steering_node` keeps KEYA disabled in the default hardware-safe config.
 
 ## Notes
 

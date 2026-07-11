@@ -58,6 +58,7 @@ class SteeringNode(Node):
         self.declare_parameter('enable_period_s', 1.0)      # ส่ง enable ซ้ำกัน motor หลุด
         self.declare_parameter('safe_steering_deg', 0.0)    # มุมที่สั่งเมื่อ timeout/fault/e-stop
         self.declare_parameter('disable_on_fault', False)   # True = ส่ง disable เมื่อ fault/e-stop
+        self.declare_parameter('enable_on_startup', False)  # True = enable ก่อนเห็นสถานะ safety
 
         ch = self.get_parameter('can_channel').value
         mid = int(self.get_parameter('motor_id').value)
@@ -69,6 +70,7 @@ class SteeringNode(Node):
         self.en_period = float(self.get_parameter('enable_period_s').value)
         self.safe_deg  = float(self.get_parameter('safe_steering_deg').value)
         self.disable_on_fault = bool(self.get_parameter('disable_on_fault').value)
+        self.enable_on_startup = bool(self.get_parameter('enable_on_startup').value)
 
         self.id_cmd = 0x06000000 + mid
         self.id_rsp = 0x05800000 + mid
@@ -103,7 +105,12 @@ class SteeringNode(Node):
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.start()
 
-        self._send_enable()
+        if self.enable_on_startup:
+            self._send_enable()
+        else:
+            self.get_logger().info(
+                'KEYA enable is gated until /steering_cmd is fresh and '
+                '/lowlevel_fault + /e_stop_status are clear')
         self.get_logger().info(
             f'steering_node up: cmd=0x{self.id_cmd:08X} hb=0x{self.id_hb:08X} '
             f'@ {self.tx_rate:.0f} Hz')
