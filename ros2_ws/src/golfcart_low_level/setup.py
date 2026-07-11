@@ -14,7 +14,7 @@ setup(
         ('share/' + package_name + '/launch', glob('launch/*.py')),
         ('share/' + package_name + '/scripts', glob('scripts/*.sh')),
     ],
-    install_requires=['setuptools', 'python-can'],
+    install_requires=['setuptools', 'python-can', 'aenum'],
     zip_safe=True,
     maintainer='GolfCart Team',
     maintainer_email='user@example.com',

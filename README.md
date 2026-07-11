@@ -3,9 +3,10 @@
 ROS 2 and STM32 firmware for a drive-by-wire golf cart low-level control layer.
 
 The Jetson Orin Nano runs the ROS 2 nodes and talks to the vehicle CAN bus through
-an InnoMaker USB2CAN adapter. The STM32G4 board controls the brake and Curtis
-1510 speed interface. The KEYA steering motor is driven directly from ROS 2 over
-extended CAN frames.
+an InnoMaker USB2CAN adapter. The STM32G4 car-shield firmware in this repository
+controls the brake board. Speed commands/status are kept in the ROS bridge for a
+separate speed controller board on the same CAN bus. The KEYA steering motor is
+driven directly from ROS 2 over extended CAN frames.
 
 ![Low-level control overview](docs/golfcart_low_level_control_overview.png)
 
@@ -16,7 +17,7 @@ extended CAN frames.
 ├── ros2_ws/
 │   └── src/golfcart_low_level/        # Jetson ROS 2 package
 ├── firmware/
-│   └── stm32_motorbrake_car_shield/   # STM32CubeIDE brake + speed firmware
+│   └── stm32_motorbrake_car_shield/   # STM32CubeIDE brake firmware
 └── docs/
     └── golfcart_low_level_control_overview.png
 ```
@@ -35,7 +36,8 @@ Jetson Orin Nano
 InnoMaker USB2CAN, SocketCAN can0, 250 kbit/s
      |
 CAN bus
-  - STM32G4 brake + speed board, standard 11-bit IDs
+  - STM32G4 brake board, standard 11-bit IDs
+  - speed controller board, standard 11-bit IDs
   - KEYA steering motor, extended 29-bit IDs
 ```
 
@@ -49,17 +51,17 @@ The user commands the cart only through `/cmd_vel`.
 
 ## CAN Protocol
 
-All STM32 brake/speed frames use classic CAN, standard 11-bit IDs, 250 kbit/s.
+The brake-side protocol below matches the current
+`firmware/stm32_motorbrake_car_shield` project, synced from
+`AJYui_MotorBrakeModule-main/MotorBrake_Firmware_Car_Shield`. The bus is classic
+CAN, standard 11-bit IDs for STM32 frames, 250 kbit/s, so it can share the same
+physical bus with the KEYA steering motor.
 
 | CAN ID | Direction | DLC | Meaning |
 |---|---|---:|---|
-| `0x120` | Jetson to STM32 | 2 | target speed, `int16` little-endian, scale `0.01 m/s` |
-| `0x121` | Jetson to STM32 | 1 | speed enable, byte0 `0/1` |
-| `0x122` | STM32 to Jetson | 2 | measured speed, `int16` little-endian, scale `0.01 m/s` |
 | `0x130` | Jetson to STM32 | 1 | brake command, byte0 `0 = release`, `1 = brake` |
 | `0x131` | STM32 to Jetson | 8 | brake status heartbeat |
-| `0x132` | Jetson to STM32 | 8 | servo calibration command, two `float32` values |
-| `0x133` | STM32 to Jetson | 8 | servo calibration status, two `float32` values |
+| `0x132` | Jetson to STM32 | 4 | brake engaged servo angle, one `float32` value in degrees |
 
 `0x131` payload:
 
@@ -69,6 +71,15 @@ All STM32 brake/speed frames use classic CAN, standard 11-bit IDs, 250 kbit/s.
 | `4` | relay active |
 | `5` | watchdog / e-stop / fault status, `0 = normal`, `1 = triggered` |
 | `6..7` | sequence counter, `uint16` little-endian |
+
+The ROS bridge also keeps the speed-controller CAN frames below. They require a
+separate speed controller board/firmware on the same bus:
+
+| CAN ID | Direction | DLC | Meaning |
+|---|---|---:|---|
+| `0x120` | Jetson to speed controller | 2 | target speed, `int16` little-endian, scale `0.01 m/s` |
+| `0x121` | Jetson to speed controller | 1 | speed enable, byte0 `0/1` |
+| `0x122` | speed controller to Jetson | 2 | measured speed, `int16` little-endian, scale `0.01 m/s` |
 
 KEYA steering uses extended CAN IDs:
 
@@ -84,7 +95,7 @@ Install ROS 2 and CAN tools first. Then install project dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y can-utils python3-can python3-colcon-common-extensions
+sudo apt install -y can-utils python3-aenum python3-can python3-colcon-common-extensions
 sudo apt install -y ros-$ROS_DISTRO-geometry-msgs ros-$ROS_DISTRO-std-msgs
 ```
 
@@ -133,11 +144,11 @@ Check raw CAN traffic:
 candump can0
 ```
 
-Expected STM32 heartbeat/status frames:
+Expected CAN heartbeat/status frames:
 
 ```text
 can0  131   [8]  ...
-can0  122   [2]  ...
+can0  122   [2]  ...   # only when the separate speed controller is present
 ```
 
 ## Run ROS 2 Low-Level Control
@@ -177,7 +188,11 @@ ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist \
 
 ## STM32 Firmware
 
-Open `firmware/stm32_motorbrake_car_shield` in STM32CubeIDE.
+Open this STM32CubeIDE firmware project:
+
+```text
+firmware/stm32_motorbrake_car_shield
+```
 
 Important FDCAN settings:
 
@@ -189,22 +204,24 @@ NominalTimeSeg2: 3
 NominalSyncJumpWidth: 1
 Nominal bitrate: 250 kbit/s
 Sample point: 82.4%
-StdFiltersNbr: 4
+StdFiltersNbr: 2
 ```
 
-Bench e-stop setting:
+`StdFiltersNbr` is `2` because the brake firmware accepts `0x130` and `0x132`.
 
-```c
-#define ESTOP_INPUT_ENABLED 0
+E-stop behavior:
+
+```text
+PD2 active-low, falling edge latches watchdog_status = 1
+PD2 is re-initialized with an internal pull-up in USER CODE
 ```
 
-The default is `0` because the e-stop circuit is not wired yet. In this mode the
-firmware keeps PD2 pulled high, disables the EXTI2 interrupt, and does not latch
-a false e-stop from an unwired connector. Set this to `1` before real driving
-tests, after the active-low e-stop circuit is connected to PD2.
+If the e-stop circuit is not wired yet, leave PD2 idle high/open so the internal
+pull-up holds it inactive. A real e-stop input should pull PD2 low. Once latched,
+the watchdog/e-stop status is reported in byte 5 of `0x131`.
 
 Build and flash the STM32 board from STM32CubeIDE. After flashing, the board
-should publish `0x131` and `0x122` periodically at about 20 ms.
+should publish `0x131` periodically at about 20 ms.
 
 ## Safety Behavior
 
@@ -230,7 +247,7 @@ Jetson/ROS layer is supervision and command arbitration, not the only safety pat
 
 No `0x131` in `candump can0`:
 
-- Confirm Jetson, STM32, and KEYA are all at 250 kbit/s.
+- Confirm Jetson, STM32 brake board, speed controller, and KEYA steering are all at 250 kbit/s.
 - Check CAN_H/CAN_L polarity.
 - Check 120 ohm termination at both ends of the bus.
 - Check CAN transceiver power and common ground/reference.

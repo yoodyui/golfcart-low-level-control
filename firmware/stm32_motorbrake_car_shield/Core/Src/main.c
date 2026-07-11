@@ -21,16 +21,14 @@
 #include "adc.h"
 #include "dma.h"
 #include "fdcan.h"
+#include "i2c.h"
 #include "tim.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>   // memcpy() for packing the float current into the CAN frame
-#include "flash_store.h"   // persist start/stop servo angles in flash (split-out lib)
-#include "curtis_io.h"     // read/drive Curtis 1510 direction/pedal/MCOR/speed-sensor
-#include "tim.h"           // htim2 + MX_TIM2_Init() for the speed-sensor input capture
-#include "i2c.h"           // hi2c2 + MX_I2C2_Init() for the MCP4725 MCOR-out DAC
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,43 +45,14 @@
  *     [4]    uint8  relay_active   (1 = Relay G2R-24 ON, 0 = OFF)
  *     [5]    uint8  watchdog_status(0 = Normal, 1 = Triggered/fault)
  *     [6..7] uint16 heartbeat sequence counter (little-endian)
- * /servo_command : PC -> STM32, ID 0x132, 8-byte. Two independent servo angles,
- *            each a little-endian float32 clamped to 0–180°. Stored in flash and
- *            recalled on boot:
- *     [0..3] float32 start_deg : servo position when the brake is OFF/released
- *            (relay open, motor free to start).
- *     [4..7] float32 stop_deg  : servo position when the brake is ON/engaged
- *            (relay closed, motor stopped).
- *            There is no polarity/sign flag any more — start and stop are set
- *            directly and independently.
- * /servo_status  : STM32 -> PC, ID 0x133, 8-byte, sent on the same 20 ms tick as
- *            0x131. The held start/stop angles (flash-recalled at boot, then the
- *            live values after each overwrite), same layout as /servo_command:
- *     [0..3] float32 start_deg (little-endian)
- *     [4..7] float32 stop_deg  (little-endian)
- * ---- Closed-loop speed control (Curtis 1510), scaled int16 in m/s ----------
- * The speed value on the wire is a signed little-endian int16 in units of
- * 0.01 m/s (SPEED_CMD_SCALE): raw = round(m/s * 100), range ±327.67 m/s. The
- * sign carries direction (>0 forward, <0 backward, 0 = stop).
- * /cmd_vel (geometry_msgs/Twist.linear.x) : PC -> STM32, ID 0x120, 2-byte:
- *     [0..1] int16 linear_x : target wheel speed, 0.01 m/s/LSB (little-endian).
- * /speed_enable (std_msgs/Bool)           : PC -> STM32, ID 0x121, data[0] =
- *            1 -> run the PID speed loop (mode relay ON), 0 -> release outputs.
- * /speed_status (Twist.linear.x)          : STM32 -> PC, ID 0x122, 2-byte, sent
- *            on the same 20 ms tick as 0x131. Measured wheel speed, same scaled
- *            int16 encoding as /cmd_vel; sign follows the commanded direction
- *            (the pulse sensor itself is unsigned):
- *     [0..1] int16 linear_x : current wheel speed, 0.01 m/s/LSB (little-endian). */
-#define CAN_ID_CMD_VEL        0x120u   /* RX: target speed (int16, 0.01 m/s/LSB) */
-#define CAN_ID_SPEED_ENABLE   0x121u   /* RX: enable PID speed control (bool)    */
-#define CAN_ID_SPEED_STATUS   0x122u   /* TX: measured speed (int16, 0.01 m/s/LSB) */
+ * /servo_command (std_msgs/Float32): PC -> STM32, ID 0x132, 4-byte:
+ *     [0..3] float32 angle_deg (little-endian, clamped to 0–180°). This is the
+ *            "brake engaged" servo position: stored in flash and recalled on
+ *            boot. The servo only drives to it while the relay is ON.
+ * (servo_status frame removed — the servo position is no longer reported back) */
 #define CAN_ID_BRAKE_CMD      0x130u
 #define CAN_ID_BRAKE_STATUS   0x131u
 #define CAN_ID_SERVO_CMD      0x132u
-#define CAN_ID_SERVO_STATUS   0x133u
-
-/* Speed value wire scaling: signed int16, 0.01 m/s per LSB (round-trip m/s). */
-#define SPEED_CMD_SCALE       100.0f
 
 /* ---- INA240A2D current sensor (gain 50 V/V) with a 2 mOhm shunt ----------
  * Unidirectional wiring (REF tied to GND) so 0 A -> ~0 V and only the
@@ -99,10 +68,6 @@
 #define CURRENT_V_PER_A       (INA240_GAIN * SHUNT_OHMS)   /* 0.1 V/A */
 #define CURRENT_OFFSET_V      0.0f                         /* unidirectional */
 #define CURRENT_ADC_INDEX     0u
-
-/* Curtis 1510 MCOR throttle wiper: wired to PA1 = ADC1_IN2 = regular rank 2, so
- * it lands in adc_buffer[1] (see the ADC1 rank order above). */
-#define MCOR_ADC_INDEX        1u
 
 /* Open-load / motor-fault check: Relay commanded ON but ~no current flowing.
  * Temporarily disabled (set to 1 to re-enable once a real load is connected). */
@@ -123,23 +88,23 @@
 /* Heartbeat: TIM6 elapses every 10 ms, so 2 ticks -> 20 ms status rate. */
 #define HEARTBEAT_TICKS       2u
 
-/* On a normal release (relay commanded OFF) the servo is driven back to the
- * start position and we keep the relay energised for this long so it can
- * physically get there before power is cut. Faults (E-Stop/overcurrent) skip
- * this and cut at once. */
+/* On a normal release (relay commanded OFF) the servo is driven back to 0° and
+ * we keep the relay energised for this long so it can physically get there
+ * before power is cut. Faults (E-Stop/overcurrent) skip this and cut at once. */
 #define SERVO_SETTLE_MS       3000u
+#define SERVO_HOME_DEG        0.0f
 
-/* Persisted start/stop servo angles: the flash layout, magic and load/save logic
- * live in the flash_store.[ch] library. What stays here is the app-level policy
- * for *when* to commit.
+/* Persisted "brake engaged" servo angle, stored in the last 2 KB page of bank 2.
  * NOTE: the G474 has no read-while-write, so a page erase (~22 ms) stalls the
  * whole CPU — interrupts included — for its duration. To avoid stalling during a
  * burst of /servo_command frames (which would make CAN look unresponsive), the
- * write is debounced: we only commit once the angles have been stable for
- * FLASH_WRITE_QUIET_MS. The boot defaults (used until a /servo_command is saved)
- * are app-level tuning knobs and are passed into FlashStore_LoadAngles(). */
-#define START_ANGLE_DEFAULT   180.0f  /* brake OFF/released */
-#define STOP_ANGLE_DEFAULT    110.0f  /* brake ON/engaged  */
+ * write is debounced: we only commit once the angle has been stable for
+ * FLASH_WRITE_QUIET_MS. One 64-bit record: [31:0] magic, [63:32] float. */
+#define FLASH_USER_ADDR       0x0807F800UL
+#define FLASH_USER_BANK       FLASH_BANK_2
+#define FLASH_USER_PAGE       127u
+#define FLASH_USER_MAGIC      0xB7A4E001UL
+#define BRAKE_ANGLE_DEFAULT   0.0f
 #define FLASH_WRITE_QUIET_MS  800u
 
 /* On a verified flash write, blink LED2 rapidly for a moment as a visual ACK.
@@ -153,12 +118,7 @@
 #define BTN_TOGGLE_Pin        GPIO_PIN_1
 #define BTN_TOGGLE_GPIO_Port  GPIOC
 
-/* E-Stop on PD2: active-low with pull-up (idle HIGH, triggered LOW -> falling).
- * Bench mode note:
- *   0 = e-stop circuit is not wired yet; ignore PD2 e-stop input.
- *   1 = real vehicle mode; PD2 falling edge latches watchdog_status=1.
- * Keep this at 0 only for bench testing. Set it to 1 before driving tests. */
-#define ESTOP_INPUT_ENABLED    0
+/* E-Stop on PD2: active-low with pull-up (idle HIGH, triggered LOW -> falling). */
 #define ESTOP_Pin             GPIO_PIN_2
 #define ESTOP_GPIO_Port       GPIOD
 /* USER CODE END PD */
@@ -172,20 +132,19 @@
 
 /* USER CODE BEGIN PV */
 volatile uint8_t relay_cmd = 0;       // 0 = OFF, 1 = ON. Set by /brake_command over CAN (or Live Expression)
-volatile float   start_angle_deg = START_ANGLE_DEFAULT; // servo angle when brake OFF/released (0–180°), persisted in flash, set by /servo_command
-volatile float   stop_angle_deg  = STOP_ANGLE_DEFAULT;  // servo angle when brake ON/engaged  (0–180°), persisted in flash, set by /servo_command
-volatile uint8_t  flash_save_req = 0;  // set by RX ISR when start/stop angle changes; flash write runs in main loop
-volatile uint32_t flash_req_tick = 0;  // HAL tick of the last start/stop angle change (debounce reference)
+volatile float   brake_angle_deg = BRAKE_ANGLE_DEFAULT; // engaged servo position, persisted in flash, set by /servo_command
+volatile uint8_t  flash_save_req = 0;  // set by RX ISR when brake_angle_deg changes; flash write runs in main loop
+volatile uint32_t flash_req_tick = 0;  // HAL tick of the last brake_angle_deg change (debounce reference)
 volatile uint8_t flash_write_ok = 0;  // 1 = last flash write read back OK (visible in Live Expression)
 volatile uint16_t led2_blink_ticks = 0; // >0 = LED2 rapid-blink countdown (10 ms ticks), set on a verified write
-volatile uint16_t adc_buffer[4];     // สร้าง Buffer รอรับค่าจาก ADC DMA
+uint16_t adc_buffer[4];     // สร้าง Buffer รอรับค่าจาก ADC DMA
 uint16_t led_counter = 0;
 
 /* Relay/servo release sequencer state (driven in the main loop). */
 typedef enum {
-	BRAKE_OFF = 0,    // relay open, servo parked at start_angle_deg
-	BRAKE_ON,         // relay closed, servo driven to stop_angle_deg
-	BRAKE_RELEASING   // servo driving back to start_angle_deg, relay still on until settle elapses
+	BRAKE_OFF = 0,    // relay open, servo parked at 0°
+	BRAKE_ON,         // relay closed, servo driven to brake_angle_deg
+	BRAKE_RELEASING   // servo driving back to 0°, relay still on until settle elapses
 } brake_state_t;
 
 /* --- Brake status / safety state shared with the ISRs --- */
@@ -195,40 +154,6 @@ float             current_ma = 0.0f;     // latest INA240 current reading, milli
 uint16_t          heartbeat_seq = 0;     // rolling counter so the PC can detect dropped frames
 
 FDCAN_TxHeaderTypeDef CanTxHeader;        // configured once in CAN_App_Init() — used for 0x131
-FDCAN_TxHeaderTypeDef CanServoTxHeader;   // configured once in CAN_App_Init() — used for 0x133
-FDCAN_TxHeaderTypeDef CanSpeedTxHeader;   // configured once in CAN_App_Init() — used for 0x122
-
-/* --- Curtis 1510 input readings, refreshed each main-loop pass (Live Expression) --- */
-volatile uint8_t curtis_forward  = 0;   // Forward_IN_to_MCU  (PC5) raw level
-volatile uint8_t curtis_backward = 0;   // Backward_IN_to_MCU (PC4) raw level
-volatile uint8_t curtis_pedal    = 0;   // Pedal_IN_to_MCU    (PB0) raw level
-volatile float   mcor_volts      = 0.0f;// MCOR throttle wiper (PA1/IN2), volts
-volatile float   speed_sensor_hz = 0.0f;// Speed_Sensor_to_MCU (PA15/TIM2 CH1), pulse Hz
-
-/* --- Output self-test (bench). Flip to 1 in a Live Expression to energise the
- * mode relay and start cycling the Forward/Backward/Pedal out lines + sweeping
- * the MCOR DAC; back to 0 releases every output and hands the Curtis back to
- * the input/pass-through side. Watch the CurtisIO_OutTest_* variables move. --- */
-volatile uint8_t output_test_enable = 0;
-#define OUTPUT_TEST_PERIOD_MS   100u   // ms between test steps (pattern advance)
-
-/* --- Manual output override (bench). Set CurtisIO_Override_forward/backward/
- * pedal (0/1) and CurtisIO_Override_mcor_volts (0..VREF) in a Live Expression,
- * then flip this to 1 to drive the Curtis outputs to exactly those values. Takes
- * precedence over the auto self-test above (only one drives the outputs). Back to
- * 0 releases every output and hands the Curtis back to the input side. --- */
-volatile uint8_t output_override_enable = 0;
-
-/* --- Closed-loop speed control (bench/ROS). Set curtis_speed_target_mps to the
- * desired wheel speed in m/s (sign = direction, 0 = stop), then flip
- * speed_control_enable to 1: the PID loop energises the mode relay and drives
- * the Curtis Forward/Backward/Pedal lines + MCOR throttle to hold that speed.
- * Takes precedence over the manual override and auto self-test (only one drives
- * the shared outputs). Back to 0 releases every output (mode relay OFF). Tune
- * with CurtisIO_Speed_Kp/Ki/Kd; watch CurtisIO_Speed_* for telemetry. --- */
-volatile uint8_t speed_control_enable    = 0;
-volatile float   curtis_speed_target_mps = 0.0f;   // desired wheel speed, m/s (signed)
-volatile float   speed_sensor_mps        = 0.0f;   // measured speed magnitude, m/s (Live Expression)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -236,10 +161,8 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void  CAN_App_Init(void);          // FDCAN filter + start + RX notification
 static void  BrakeStatus_Send(void);      // pack and transmit the /brake_status heartbeat frame
-static void  ServoStatus_Send(void);      // transmit the held start/stop angles (0x133)
-static void  SpeedStatus_Send(void);      // transmit the speed-sensor reading (0x122)
-/* Persisted start/stop servo angles now live in flash_store.[ch]:
- *   FlashStore_LoadAngles() / FlashStore_SaveAngles() */
+static float   Flash_LoadBrakeAngle(float fallback); // recall the persisted brake angle on boot
+static uint8_t Flash_SaveBrakeAngle(float angle);    // persist the brake angle; returns 1 if readback verifies
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -250,19 +173,47 @@ static uint32_t deg_to_pulse(float deg) {
     return (uint32_t)(1000.0f + deg * (1000.0f / 180.0f));
 }
 
-/* Wire encoding for the speed frames: m/s -> signed int16 in 0.01 m/s units,
- * rounded and clamped to the int16 range so a huge value cannot wrap. */
-static int16_t mps_to_raw(float mps) {
-    float scaled = mps * SPEED_CMD_SCALE;
-    scaled += (scaled >= 0.0f) ? 0.5f : -0.5f;   /* round to nearest */
-    if (scaled >  32767.0f) scaled =  32767.0f;
-    if (scaled < -32768.0f) scaled = -32768.0f;
-    return (int16_t) scaled;
+/* Read the persisted brake angle. Returns `fallback` if the page was never
+ * written (magic mismatch) or holds an out-of-range value. */
+static float Flash_LoadBrakeAngle(float fallback) {
+    uint64_t rec = *(__IO uint64_t *) FLASH_USER_ADDR;
+    if ((uint32_t) (rec & 0xFFFFFFFFUL) != FLASH_USER_MAGIC) {
+        return fallback;
+    }
+    uint32_t bits = (uint32_t) (rec >> 32);
+    float angle;
+    memcpy(&angle, &bits, sizeof(float));
+    if (angle < 0.0f || angle > 180.0f) {
+        return fallback;
+    }
+    return angle;
 }
 
-/* Inverse of mps_to_raw: signed int16 (0.01 m/s/LSB) -> m/s. */
-static float raw_to_mps(int16_t raw) {
-    return (float) raw / SPEED_CMD_SCALE;
+/* Erase the user page and store the brake angle as one 64-bit record. The ~22 ms
+ * page erase stalls the whole CPU (no RWW on the G474), so callers must debounce
+ * this — see FLASH_WRITE_QUIET_MS. Reads the record back and returns 1 only if it
+ * matches what we intended to write. */
+static uint8_t Flash_SaveBrakeAngle(float angle) {
+    uint32_t bits;
+    memcpy(&bits, &angle, sizeof(float));
+    uint64_t rec = ((uint64_t) bits << 32) | (uint64_t) FLASH_USER_MAGIC;
+
+    FLASH_EraseInitTypeDef erase = {0};
+    uint32_t page_err = 0;
+    erase.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase.Banks     = FLASH_USER_BANK;
+    erase.Page      = FLASH_USER_PAGE;
+    erase.NbPages   = 1;
+
+    HAL_StatusTypeDef st = HAL_ERROR;
+    HAL_FLASH_Unlock();
+    if (HAL_FLASHEx_Erase(&erase, &page_err) == HAL_OK) {
+        st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, FLASH_USER_ADDR, rec);
+    }
+    HAL_FLASH_Lock();
+
+    /* Verify: the programmed doubleword must read back exactly. */
+    return (st == HAL_OK && *(__IO uint64_t *) FLASH_USER_ADDR == rec) ? 1u : 0u;
 }
 /* USER CODE END 0 */
 
@@ -300,14 +251,10 @@ int main(void)
   MX_FDCAN1_Init();
   MX_TIM1_Init();
   MX_TIM6_Init();
-  MX_TIM2_Init();   /* speed-sensor input capture (TIM2 CH1 / PA15) */
-
+  MX_I2C2_Init();
+  MX_UART4_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-	/* MCP4725 MCOR-out DAC lives on I2C2. CubeMX did not emit MX_I2C2_Init() in
-	 * the generated block, so bring it up here (USER CODE = regen-safe) before any
-	 * CurtisIO_McorWrite*() call. */
-	MX_I2C2_Init();
-
 	/* PC1 = local toggle button (active-high, internal pull-down). Configured
 	 * here in USER CODE so it survives CubeMX regeneration of gpio.c (CubeMX
 	 * generates this pin as USER_SW with GPIO_NOPULL). */
@@ -321,49 +268,27 @@ int main(void)
 
 	/* E-Stop (PD2): CubeMX generates this EXTI pin as GPIO_NOPULL, which leaves
 	 * the active-low line floating and fires spurious falling edges -> false
-	 * watchdog_status=1. Re-init here (USER CODE = regen-safe). */
+	 * watchdog_status=1. Re-init with internal pull-up (USER CODE = regen-safe)
+	 * and drop any edge latched during boot/re-config before we start. */
 	GPIO_InitTypeDef estop_init = {0};
 	__HAL_RCC_GPIOD_CLK_ENABLE();
 	estop_init.Pin = ESTOP_Pin;
-#if ESTOP_INPUT_ENABLED
 	estop_init.Mode = GPIO_MODE_IT_FALLING;
 	estop_init.Pull = GPIO_PULLUP;
 	estop_init.Speed = GPIO_SPEED_FREQ_LOW;
 	HAL_GPIO_Init(ESTOP_GPIO_Port, &estop_init);
 	__HAL_GPIO_EXTI_CLEAR_IT(ESTOP_Pin);
 	HAL_NVIC_ClearPendingIRQ(EXTI2_IRQn);
-#else
-	/* Bench-only bypass: keep the pin pulled high and disable EXTI2 so an
-	 * unwired e-stop connector cannot latch a false fault. */
-	estop_init.Mode = GPIO_MODE_INPUT;
-	estop_init.Pull = GPIO_PULLUP;
-	estop_init.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(ESTOP_GPIO_Port, &estop_init);
-	__HAL_GPIO_EXTI_CLEAR_IT(ESTOP_Pin);
-	HAL_NVIC_ClearPendingIRQ(EXTI2_IRQn);
-	HAL_NVIC_DisableIRQ(EXTI2_IRQn);
-#endif
-	watchdog_status = 0;            // clear false latch from boot/re-config
+	watchdog_status = 0;            // clear false latch from a floating boot edge
 
-	/* Recall the start/stop angles saved by the last /servo_command (defaults if
-	 * the flash page was never written). */
-	float loaded_start, loaded_stop;
-	FlashStore_LoadAngles(&loaded_start, &loaded_stop,
-			START_ANGLE_DEFAULT, STOP_ANGLE_DEFAULT);
-	start_angle_deg = loaded_start;
-	stop_angle_deg  = loaded_stop;
+	/* Recall the brake angle saved by the last /servo_command (default 0° if the
+	 * flash page was never written). */
+	brake_angle_deg = Flash_LoadBrakeAngle(BRAKE_ANGLE_DEFAULT);
 
 	CAN_App_Init();                 // ตั้งค่า Filter + Start FDCAN + เปิด RX Interrupt
 	HAL_TIM_Base_Start_IT(&htim6);  // เริ่ม Timer ของ WDI
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // เริ่ม PWM ของ Servo
 	HAL_ADC_Start_DMA(&hadc1, (uint32_t*) adc_buffer, 4);
-
-	/* Speed sensor (PA15 -> TIM2 CH1): start input capture with interrupt. CubeMX
-	 * generated TIM2 without its NVIC line enabled, so enable it here (USER CODE =
-	 * regen-safe). The TIM2_IRQHandler lives in stm32g4xx_it.c (also USER CODE). */
-	HAL_NVIC_SetPriority(TIM2_IRQn, 5, 0);
-	HAL_NVIC_EnableIRQ(TIM2_IRQn);
-	HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -379,37 +304,31 @@ int main(void)
 		 *   RELEASING -> OFF   : after SERVO_SETTLE_MS the relay opens
 		 * A fault (watchdog_status=1) cuts the relay immediately from any state. */
 		static brake_state_t brake_state = BRAKE_OFF;
-		static float    servo_target  = START_ANGLE_DEFAULT;
+		static float    servo_target  = SERVO_HOME_DEG;
 		static uint32_t release_tick  = 0;
-
-		/* Engage/release endpoints, set independently via /servo_command:
-		 *   brake ON  (engaged) -> stop_deg
-		 *   brake OFF (released)-> start_deg */
-		float engaged_deg  = stop_angle_deg;
-		float released_deg = start_angle_deg;
 
 		if (watchdog_status == 1) {
 			/* E-Stop / latched fault: open relay now, no graceful return. */
 			HAL_GPIO_WritePin(RELAY_Brake_GPIO_Port, RELAY_Brake_Pin, GPIO_PIN_RESET);
-			servo_target = released_deg;
+			servo_target = SERVO_HOME_DEG;
 			brake_state  = BRAKE_OFF;
 		} else {
 			switch (brake_state) {
 			case BRAKE_OFF:
 				HAL_GPIO_WritePin(RELAY_Brake_GPIO_Port, RELAY_Brake_Pin, GPIO_PIN_RESET);
-				servo_target = released_deg;
+				servo_target = SERVO_HOME_DEG;
 				if (relay_cmd == 1) {
 					HAL_GPIO_WritePin(RELAY_Brake_GPIO_Port, RELAY_Brake_Pin, GPIO_PIN_SET);
-					servo_target = engaged_deg;
+					servo_target = brake_angle_deg;
 					brake_state  = BRAKE_ON;
 				}
 				break;
 
 			case BRAKE_ON:
 				HAL_GPIO_WritePin(RELAY_Brake_GPIO_Port, RELAY_Brake_Pin, GPIO_PIN_SET);
-				servo_target = engaged_deg;   /* follow live angle updates */
+				servo_target = brake_angle_deg;   /* follow live angle updates */
 				if (relay_cmd == 0) {
-					servo_target = released_deg; /* drive to release position before powering off */
+					servo_target = SERVO_HOME_DEG; /* drive home before powering off */
 					release_tick = HAL_GetTick();
 					brake_state  = BRAKE_RELEASING;
 				}
@@ -417,9 +336,9 @@ int main(void)
 
 			case BRAKE_RELEASING:
 				HAL_GPIO_WritePin(RELAY_Brake_GPIO_Port, RELAY_Brake_Pin, GPIO_PIN_SET);
-				servo_target = released_deg;
+				servo_target = SERVO_HOME_DEG;
 				if (relay_cmd == 1) {              /* re-engaged mid-release */
-					servo_target = engaged_deg;
+					servo_target = brake_angle_deg;
 					brake_state  = BRAKE_ON;
 				} else if ((HAL_GetTick() - release_tick) >= SERVO_SETTLE_MS) {
 					HAL_GPIO_WritePin(RELAY_Brake_GPIO_Port, RELAY_Brake_Pin, GPIO_PIN_RESET);
@@ -462,7 +381,7 @@ int main(void)
 			if ((now - oc_over_since) >= OVERCURRENT_TRIP_MS) {
 				HAL_GPIO_WritePin(RELAY_Brake_GPIO_Port, RELAY_Brake_Pin, GPIO_PIN_RESET);
 				relay_cmd    = 0;
-				servo_target = released_deg;
+				servo_target = SERVO_HOME_DEG;
 				brake_state  = BRAKE_OFF;
 			}
 		} else {
@@ -472,55 +391,23 @@ int main(void)
 		/* Drive the servo PWM to the sequencer's current target. */
 		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, deg_to_pulse(servo_target));
 
-		/* Persist freshly received start/stop angles outside the RX ISR. Erasing
+		/* Persist a freshly received brake angle outside the RX ISR. Erasing
 		 * bank 2 is RWW-safe, so this does not stall the heartbeat below. */
-		/* Debounced flash persist: commit only after the angles have been stable for
+		/* Debounced flash persist: commit only after the angle has been stable for
 		 * FLASH_WRITE_QUIET_MS, so a burst of /servo_command frames does not trigger
 		 * back-to-back ~22 ms erase stalls (which would drop/delay CAN frames). */
 		if (flash_save_req && (HAL_GetTick() - flash_req_tick) >= FLASH_WRITE_QUIET_MS) {
 			flash_save_req = 0;
-			flash_write_ok = FlashStore_SaveAngles(start_angle_deg, stop_angle_deg);
+			flash_write_ok = Flash_SaveBrakeAngle(brake_angle_deg);
 			if (flash_write_ok) {
 				led2_blink_ticks = LED2_BLINK_TICKS;  // rapid-blink LED2 as a write ACK
 			}
 		}
 
-		/* Refresh the Curtis 1510 input readings (Live Expression / future use):
-		 *   - Forward/Backward/Pedal digital lines (raw pin levels)
-		 *   - MCOR throttle wiper voltage (ADC1_IN2 via the DMA buffer)
-		 *   - speed-sensor pulse frequency (TIM2 CH1 input capture) */
-		CurtisDigitalInputs_t curtis_in;
-		CurtisIO_ReadDigital(&curtis_in);
-		curtis_forward  = curtis_in.forward;
-		curtis_backward = curtis_in.backward;
-		curtis_pedal    = curtis_in.pedal;
-		mcor_volts      = CurtisIO_McorVolts(adc_buffer[MCOR_ADC_INDEX]);
-		speed_sensor_hz = CurtisIO_SpeedHz();
-		speed_sensor_mps = CurtisIO_SpeedMps();
-
-		/* Curtis output drivers (Live Expression, bench). Three mutually exclusive
-		 * modes share the mode relay + output lines, so only one may drive at a
-		 * time. Precedence: speed control > manual override > auto self-test.
-		 *   - speed_control_enable   : PID loop holds curtis_speed_target_mps (m/s)
-		 *   - output_override_enable : drive outputs to the CurtisIO_Override_* values
-		 *   - output_test_enable     : rotating auto self-test pattern / MCOR sweep
-		 * Each is non-blocking and releases its outputs on the falling edge; gate
-		 * the lower-priority ones off so a released mode does not fight the relay. */
-		uint8_t sc_on = speed_control_enable;
-		uint8_t ov_on = output_override_enable && !sc_on;
-		CurtisIO_SpeedControlRun(sc_on, curtis_speed_target_mps);
-		CurtisIO_OutputOverrideRun(ov_on);
-//		CurtisIO_OutputTestRun(output_test_enable && !ov_on && !sc_on, OUTPUT_TEST_PERIOD_MS);
-
-		/* Transmit the held servo angle (0x133) + /brake_status heartbeat on the
-		 * 20 ms tick. 0x133 goes FIRST so the bridge has the current angle in
-		 * hand before it publishes /brake_status on receiving 0x131 — otherwise
-		 * the first heartbeat after a fresh MCU start carries a stale 0°. */
+		/* Transmit the /brake_status heartbeat on the 20 ms tick. */
 		if (can_tx_flag) {
 			can_tx_flag = 0;
-			ServoStatus_Send();
 			BrakeStatus_Send();
-			SpeedStatus_Send();
 		}
 	}
   /* USER CODE END 3 */
@@ -584,15 +471,14 @@ static void CAN_App_Init(void)
 	 * regeneration of fdcan.c. MX_FDCAN1_Init() already ran, so the peripheral
 	 * is in configuration mode; we override the values that CubeMX regenerates
 	 * from the .ioc back to placeholders.
-	 *   250 kbit/s @ 170 MHz kernel clock: 170e6 / (40 * (1+13+3)) = 250 000 bps
+	 *   250 kbps @ 170 MHz kernel clock: 170e6 / (40 * (1+13+3)) = 250 000 bps
 	 *   Sample point = (1+13)/17 = 82.4 %                                      */
 	hfdcan1.Init.AutoRetransmission = ENABLE;
 	hfdcan1.Init.NominalPrescaler = 40;
 	hfdcan1.Init.NominalSyncJumpWidth = 1;
 	hfdcan1.Init.NominalTimeSeg1 = 13;
 	hfdcan1.Init.NominalTimeSeg2 = 3;
-	/* slot 0: /brake_command, 1: /servo_command, 2: /cmd_vel, 3: /speed_enable */
-	hfdcan1.Init.StdFiltersNbr = 4;
+	hfdcan1.Init.StdFiltersNbr = 2;   /* slot 0: /brake_command, slot 1: /servo_command */
 	if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) {
 		Error_Handler();
 	}
@@ -616,20 +502,6 @@ static void CAN_App_Init(void)
 	if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) {
 		Error_Handler();
 	}
-
-	/* Accept /cmd_vel (0x120): target wheel speed for the PID loop */
-	sFilterConfig.FilterIndex = 2;
-	sFilterConfig.FilterID1 = CAN_ID_CMD_VEL;
-	if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) {
-		Error_Handler();
-	}
-
-	/* Accept /speed_enable (0x121): turn the PID speed loop on/off */
-	sFilterConfig.FilterIndex = 3;
-	sFilterConfig.FilterID1 = CAN_ID_SPEED_ENABLE;
-	if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) {
-		Error_Handler();
-	}
 	if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
 			FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK) {
 		Error_Handler();
@@ -645,16 +517,6 @@ static void CAN_App_Init(void)
 	CanTxHeader.FDFormat = FDCAN_CLASSIC_CAN;
 	CanTxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
 	CanTxHeader.MessageMarker = 0;
-
-	/* Servo-status frame (0x133): 8-byte, two float32 (start_deg, stop_deg). */
-	CanServoTxHeader = CanTxHeader;
-	CanServoTxHeader.Identifier = CAN_ID_SERVO_STATUS;
-	CanServoTxHeader.DataLength = FDCAN_DLC_BYTES_8;
-
-	/* Speed-status frame (0x122): 2-byte, int16 scaled m/s (linear_x). */
-	CanSpeedTxHeader = CanTxHeader;
-	CanSpeedTxHeader.Identifier = CAN_ID_SPEED_STATUS;
-	CanSpeedTxHeader.DataLength = FDCAN_DLC_BYTES_2;
 
 	if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
 		Error_Handler();
@@ -695,42 +557,7 @@ static void BrakeStatus_Send(void)
 }
 
 /**
-  * @brief Report the held start/stop angles (0x133): flash values at boot, then
-  *        the live /servo_command values after each overwrite.
-  */
-static void ServoStatus_Send(void)
-{
-	float s = start_angle_deg;   /* volatile -> local snapshot */
-	float t = stop_angle_deg;
-	uint8_t TxData[8];
-	memcpy(&TxData[0], &s, sizeof(float)); /* [0..3] float32 start_deg, little-endian */
-	memcpy(&TxData[4], &t, sizeof(float)); /* [4..7] float32 stop_deg,  little-endian */
-
-	HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &CanServoTxHeader, TxData);
-}
-
-/**
-  * @brief Report the current wheel speed (0x122) as Twist.linear.x, encoded as a
-  *        signed int16 in 0.01 m/s units. The pulse sensor is unsigned, so the
-  *        sign is taken from the commanded direction (curtis_speed_target_mps).
-  */
-static void SpeedStatus_Send(void)
-{
-	float mag = speed_sensor_mps;   /* measured magnitude, m/s (>= 0) */
-	/* Re-apply the commanded sign so the PC sees a signed cmd_vel-style speed. */
-	float signed_mps = (curtis_speed_target_mps < 0.0f) ? -mag : mag;
-	int16_t raw = mps_to_raw(signed_mps);
-
-	uint8_t TxData[2];
-	TxData[0] = (uint8_t) (raw & 0xFFu);          /* [0..1] int16 linear_x, LE */
-	TxData[1] = (uint8_t) ((raw >> 8) & 0xFFu);
-
-	HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &CanSpeedTxHeader, TxData);
-}
-
-/**
-  * @brief FDCAN RX FIFO0 callback: decode /brake_command, /cmd_vel,
-  *        /speed_enable and /servo_command frames.
+  * @brief FDCAN RX FIFO0 callback: decode /brake_command and /servo_command frames.
   */
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
@@ -746,43 +573,19 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 		if (RxHeader.Identifier == CAN_ID_BRAKE_CMD) {
 			/* std_msgs/Bool: data:true -> Relay ON (engage), data:false -> Relay OFF. */
 			relay_cmd = (RxData[0] != 0u) ? 1u : 0u;
-		} else if (RxHeader.Identifier == CAN_ID_CMD_VEL) {
-			/* 2-byte signed int16, 0.01 m/s/LSB: PID target wheel speed (signed). */
-			int16_t raw = (int16_t) ((uint16_t) RxData[0]
-			                       | ((uint16_t) RxData[1] << 8));
-			curtis_speed_target_mps = raw_to_mps(raw);
-		} else if (RxHeader.Identifier == CAN_ID_SPEED_ENABLE) {
-			/* std_msgs/Bool: 1 -> run the PID speed loop, 0 -> release outputs. */
-			speed_control_enable = (RxData[0] != 0u) ? 1u : 0u;
 		} else if (RxHeader.Identifier == CAN_ID_SERVO_CMD) {
-			/* 8-byte: [0..3] start_deg, [4..7] stop_deg. Takes effect immediately;
+			/* std_msgs/Float32: new "brake engaged" angle. Takes effect immediately;
 			 * the flash persist is debounced in the main loop (FLASH_WRITE_QUIET_MS). */
-			float new_start, new_stop;
-			memcpy(&new_start, &RxData[0], sizeof(float));
-			memcpy(&new_stop,  &RxData[4], sizeof(float));
-			/* Clamp both to the valid servo range 0..180°. */
-			if (new_start < 0.0f) new_start = 0.0f;
-			if (new_start > 180.0f) new_start = 180.0f;
-			if (new_stop  < 0.0f) new_stop  = 0.0f;
-			if (new_stop  > 180.0f) new_stop  = 180.0f;
-			if (new_start != start_angle_deg || new_stop != stop_angle_deg) {
-				start_angle_deg = new_start;
-				stop_angle_deg  = new_stop;
+			float angle;
+			memcpy(&angle, &RxData[0], sizeof(float));
+			if (angle < 0.0f)   angle = 0.0f;
+			if (angle > 180.0f) angle = 180.0f;
+			if (angle != brake_angle_deg) {
+				brake_angle_deg = angle;
 				flash_save_req  = 1;
 				flash_req_tick  = HAL_GetTick();  /* restart the debounce window */
 			}
 		}
-	}
-}
-
-/**
-  * @brief TIM input-capture callback: speed sensor edges on TIM2 CH1 (PA15).
-  *        Hands each captured counter value to the curtis_io speed tracker.
-  */
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
-{
-	if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-		CurtisIO_SpeedOnCapture(HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1));
 	}
 }
 
@@ -836,9 +639,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if (GPIO_Pin == ESTOP_Pin) // ตรวจสอบว่าเป็น Interrupt จากขา PD2
+  if (GPIO_Pin == GPIO_PIN_2) // ตรวจสอบว่าเป็น Interrupt จากขา PD2
   {
-#if ESTOP_INPUT_ENABLED
     // 0. กรอง glitch: noise ตอนคอยล์ relay สวิตช์ทำให้ PD2 เกิด falling edge ปลอม.
     //    E-Stop จริงจะกดค้างให้สาย LOW ต่อเนื่อง ส่วน glitch จะเด้งกลับ HIGH ทันที.
     //    spin สั้นๆ แล้วอ่านซ้ำ ถ้ากลับเป็น HIGH = glitch -> ไม่ latch.
@@ -857,11 +659,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
     // 3. ตั้งสถานะ watchdog ให้เป็น Triggered เพื่อให้ PC รู้ว่าเกิด E-Stop
     watchdog_status = 1;
-#else
-    /* Bench-only bypass: PD2 e-stop input is intentionally ignored until the
-     * real e-stop circuit is wired and ESTOP_INPUT_ENABLED is set to 1. */
-    __HAL_GPIO_EXTI_CLEAR_IT(ESTOP_Pin);
-#endif
   }
 }
 /* USER CODE END 4 */

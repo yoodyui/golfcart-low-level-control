@@ -11,11 +11,16 @@ Flow ต่อ 1 รอบ control loop (50 Hz):
 cmd_vel.angular.z = yaw rate (rad/s) จริง -> แปลงเป็นมุมเลี้ยวด้วย bicycle model
   delta = atan(wheelbase * yaw_rate / v)   (มี guard กันหารด้วยศูนย์)
 
-Wire format (ตรงกับ MotorBrake_Firmware_Car_Shield/Core/Src/main.c):
+Wire format:
+  Speed controller board:
   TX 0x120  int16 LE, 0.01 m/s/LSB   target speed
   TX 0x121  byte0: 1=enable PID      speed enable
-  TX 0x130  byte0: 1=brake 0=release brake command
   RX 0x122  int16 LE, 0.01 m/s/LSB   measured speed
+
+  Brake board (ตรงกับ firmware/stm32_motorbrake_car_shield,
+  synced from AJYui_MotorBrakeModule-main/MotorBrake_Firmware_Car_Shield):
+  TX 0x130  byte0: 1=brake 0=release brake command
+  TX 0x132  float32 LE               brake engaged servo angle_deg (0..180)
   RX 0x131  [0..3] float32 LE current_mA, [4] relay_active,
             [5] watchdog/e-stop (0=Normal, 1=Triggered), [6..7] uint16 seq
 
@@ -23,9 +28,11 @@ Safety rules (diagram V2):
   1) e-stop (จาก 0x131)   -> enable=0, speed=0, brake=1
   2) /cmd_vel timeout      -> enable=0, speed=0, brake=1
   3) board fault/heartbeat -> enable=0, speed=0, brake=1
-  4) normal                -> brake=0, enable=1, speed=linear.x, /steering_cmd
+  4) normal moving         -> brake=0, enable=1, speed=linear.x, /steering_cmd
+  5) normal zero command   -> enable=0, speed=0, brake follows brake_on_zero_cmd
 
-Before running:  sudo ip link set can0 up type can bitrate 250000
+Before running:
+  sudo ip link set can0 up type can bitrate 250000
 """
 
 import math
@@ -36,13 +43,14 @@ import can
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool, Float64, Float32, UInt8
+from std_msgs.msg import Bool, Float64, Float32, UInt8, UInt16
 
 CAN_ID_SPEED_CMD    = 0x120
 CAN_ID_SPEED_ENABLE = 0x121
 CAN_ID_SPEED_STATUS = 0x122
 CAN_ID_BRAKE_CMD    = 0x130
 CAN_ID_BRAKE_STATUS = 0x131
+CAN_ID_BRAKE_SERVO_CMD = 0x132
 
 SPEED_SCALE = 100.0          # int16 raw = m/s * 100
 
@@ -53,23 +61,34 @@ class RosCanBridge(Node):
 
         # ---------- parameters ----------
         self.declare_parameter('can_channel', 'can0')
+        self.declare_parameter('can_bitrate', 250000)      # SocketCAN must be brought up with this
         self.declare_parameter('control_rate_hz', 50.0)
         self.declare_parameter('cmd_vel_timeout_s', 0.5)
         self.declare_parameter('board_timeout_s', 0.5)     # 0x131 มาทุก 20 ms
+        self.declare_parameter('brake_cmd_can_id', CAN_ID_BRAKE_CMD)
+        self.declare_parameter('brake_status_can_id', CAN_ID_BRAKE_STATUS)
+        self.declare_parameter('brake_servo_cmd_can_id', CAN_ID_BRAKE_SERVO_CMD)
         self.declare_parameter('wheelbase_m', 1.65)        # <- วัดจากรถจริง
         self.declare_parameter('max_speed_mps', 5.0)
         self.declare_parameter('max_steering_deg', 50.0)
         # ต่ำกว่าความเร็วนี้จะไม่คำนวณ atan (กันหารด้วยศูนย์ / มุมระเบิดที่ v ต่ำ)
         self.declare_parameter('min_speed_for_steering_mps', 0.1)
+        # false = startup/idle cmd_vel zero releases brake; true = zero command holds brake.
+        self.declare_parameter('brake_on_zero_cmd', False)
 
         ch          = self.get_parameter('can_channel').value
+        self.can_bitrate = int(self.get_parameter('can_bitrate').value)
         rate        = self.get_parameter('control_rate_hz').value
         self.cmd_to = self.get_parameter('cmd_vel_timeout_s').value
         self.brd_to = self.get_parameter('board_timeout_s').value
+        self.brake_cmd_can_id = int(self.get_parameter('brake_cmd_can_id').value)
+        self.brake_status_can_id = int(self.get_parameter('brake_status_can_id').value)
+        self.brake_servo_cmd_can_id = int(self.get_parameter('brake_servo_cmd_can_id').value)
         self.wheelbase = self.get_parameter('wheelbase_m').value
         self.max_speed = self.get_parameter('max_speed_mps').value
         self.max_steer = math.radians(self.get_parameter('max_steering_deg').value)
         self.min_v     = self.get_parameter('min_speed_for_steering_mps').value
+        self.brake_on_zero_cmd = bool(self.get_parameter('brake_on_zero_cmd').value)
 
         # ---------- CAN ----------
         self.bus = can.Bus(channel=ch, interface='socketcan')
@@ -83,25 +102,36 @@ class RosCanBridge(Node):
         self.last_board_stamp = None
         self.last_steer = 0.0
         self.measured_speed = 0.0
+        self.last_brake_angle_cmd_deg = 0.0
 
         # ---------- ROS I/O ----------
         self.create_subscription(Twist, '/cmd_vel', self._cb_cmd_vel, 10)
+        self.create_subscription(Float32, '/servo_command', self._cb_brake_angle, 10)
+        self.create_subscription(Float32, '/brake_angle_cmd', self._cb_brake_angle, 10)
 
         self.pub_steer_cmd   = self.create_publisher(Float64, '/steering_cmd', 10)
         self.pub_estop       = self.create_publisher(Bool,   '/e_stop_status', 10)
         self.pub_speed_meas  = self.create_publisher(Float64, '/speed_status', 10)
         self.pub_brake_state = self.create_publisher(UInt8,  '/brake_status', 10)
         self.pub_brake_cur   = self.create_publisher(Float32, '/brake_current', 10)
+        self.pub_brake_seq   = self.create_publisher(UInt16, '/brake_sequence', 10)
         self.pub_fault       = self.create_publisher(Bool,   '/lowlevel_fault', 10)
 
         self.create_timer(1.0 / rate, self._control_loop)
         self._rx_thread.start()
-        self.get_logger().info(f'ros_can_bridge up on {ch} (angular.z = yaw rate)')
+        self.get_logger().info(
+            f'ros_can_bridge up on {ch}; expected CAN bitrate {self.can_bitrate} bps '
+            '(angular.z = yaw rate)')
 
     # ================= ROS callbacks =================
     def _cb_cmd_vel(self, msg: Twist):
         self.cmd = msg
         self.last_cmd_stamp = self.get_clock().now()
+
+    def _cb_brake_angle(self, msg: Float32):
+        angle = max(0.0, min(180.0, float(msg.data)))
+        self.last_brake_angle_cmd_deg = angle
+        self._send_brake_angle(angle)
 
     # ================= main control loop =================
     def _control_loop(self):
@@ -135,10 +165,11 @@ class RosCanBridge(Node):
             self._send_enable(1)
             self._send_speed(v)
         else:
-            # ผู้ใช้สั่งหยุด (linear.x = 0) -> ปล่อยคันเร่ง + เบรก
+            # ผู้ใช้สั่งหยุด/idle (linear.x = 0): ปล่อยคันเร่งเสมอ.
+            # brake_on_zero_cmd=false เหมาะกับ bench/startup ที่ยังไม่อยากให้เบรกทำงาน.
             self._send_enable(0)
             self._send_speed(0.0)
-            self._send_brake(1)
+            self._send_brake(1 if self.brake_on_zero_cmd else 0)
 
         steer = self._compute_steering(v)
         self.last_steer = steer
@@ -175,7 +206,11 @@ class RosCanBridge(Node):
         self._tx(CAN_ID_SPEED_ENABLE, bytes([1 if en else 0]))
 
     def _send_brake(self, b: int):
-        self._tx(CAN_ID_BRAKE_CMD, bytes([1 if b else 0]))
+        self._tx(self.brake_cmd_can_id, bytes([1 if b else 0]))
+
+    def _send_brake_angle(self, angle_deg: float):
+        angle = max(0.0, min(180.0, float(angle_deg)))
+        self._tx(self.brake_servo_cmd_can_id, struct.pack('<f', angle))
 
     # ================= CAN RX (thread) =================
     def _rx_loop(self):
@@ -189,20 +224,23 @@ class RosCanBridge(Node):
                 self.measured_speed = raw / SPEED_SCALE
                 self.pub_speed_meas.publish(Float64(data=self.measured_speed))
 
-            elif msg.arbitration_id == CAN_ID_BRAKE_STATUS and len(msg.data) >= 8:
+            elif msg.arbitration_id == self.brake_status_can_id and len(msg.data) >= 8:
                 d = bytes(msg.data)
                 current_ma = struct.unpack_from('<f', d, 0)[0]
                 relay      = d[4]
-                estop      = bool(d[5])        # watchdog/e-stop byte จากบอร์ดเบรก
+                watchdog   = int(d[5])         # 0=Normal, 1=E-stop/open-load/overcurrent fault
+                sequence   = struct.unpack_from('<H', d, 6)[0]
+                estop      = bool(watchdog)
                 self.last_board_stamp = self.get_clock().now()
 
                 if estop and not self.estop_active:
-                    self.get_logger().warn('E-STOP from brake board (0x131)')
+                    self.get_logger().warn('Brake watchdog/e-stop from brake board (0x131)')
                 self.estop_active = estop
 
                 self.pub_estop.publish(Bool(data=estop))
                 self.pub_brake_state.publish(UInt8(data=relay))
                 self.pub_brake_cur.publish(Float32(data=current_ma))
+                self.pub_brake_seq.publish(UInt16(data=sequence))
 
     def destroy_node(self):
         self._rx_stop.set()
