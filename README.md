@@ -39,10 +39,13 @@ CAN bus
   - KEYA steering motor, extended 29-bit IDs
 ```
 
-The user commands the cart only through `/cmd_vel`.
+Normal driving commands go through `/cmd_vel`. A separate `/brake_cmd` topic is
+provided for manual brake bench tests and hardware checkout.
 
 - `cmd_vel.linear.x` is target speed in m/s.
 - `cmd_vel.angular.z` is yaw rate in rad/s.
+- `/brake_cmd` (`std_msgs/msg/Bool`) is a manual brake override:
+  `true = brake`, `false = return to /cmd_vel control`.
 - `ros_can_bridge` converts yaw rate to steering angle with a bicycle model.
 - `ros_can_bridge` owns speed/brake safety logic.
 - `steering_node` owns KEYA motor command, heartbeat, timeout, and steering fault handling.
@@ -207,6 +210,46 @@ Slow straight test, only when the vehicle is mechanically safe:
 ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist \
   "{linear: {x: 0.2}, angular: {z: 0.0}}"
 ```
+
+## Brake Command Examples
+
+`ros_can_bridge` normally commands the brake automatically from `/cmd_vel` and
+safety state. For manual brake testing, use `/brake_cmd`:
+
+```bash
+ros2 topic pub --once /brake_cmd std_msgs/msg/Bool "{data: true}"
+```
+
+That sends this safe low-level command set every control loop:
+
+```text
+speed_enable = 0
+target_speed = 0
+brake_cmd = 1    # CAN 0x130 byte0 = 1
+```
+
+To release the manual brake override, keep a fresh stopped `/cmd_vel` publishing
+and then send:
+
+```bash
+ros2 topic pub --once /brake_cmd std_msgs/msg/Bool "{data: false}"
+```
+
+With the default `brake_on_zero_cmd: false`, a fresh zero `/cmd_vel` releases the
+brake after `/brake_cmd` is false. If `brake_on_zero_cmd: true`, zero `/cmd_vel`
+keeps the brake engaged.
+
+Watch feedback while testing:
+
+```bash
+ros2 topic echo /brake_status
+ros2 topic echo /brake_current
+ros2 topic echo /brake_angle
+candump can0,130:7FF,131:7FF,134:7FF
+```
+
+More step-by-step brake test examples are in
+[`docs/brake_control_examples.md`](docs/brake_control_examples.md).
 
 ## STM32 Firmware
 

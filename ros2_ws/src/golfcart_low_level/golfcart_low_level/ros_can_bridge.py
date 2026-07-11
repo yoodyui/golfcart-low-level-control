@@ -8,6 +8,10 @@ Flow ต่อ 1 รอบ control loop (50 Hz):
   3) สร้าง condition (e-stop / cmd_vel timeout / board fault)
   4) จากนั้นค่อยสั่ง steering (/steering_cmd), brake (0x130), speed (0x120/0x121)
 
+Manual brake test:
+  /brake_cmd (std_msgs/Bool) = true  -> enable=0, speed=0, brake=1
+  /brake_cmd (std_msgs/Bool) = false -> return control to /cmd_vel + safety logic
+
 cmd_vel.angular.z = yaw rate (rad/s) จริง -> แปลงเป็นมุมเลี้ยวด้วย bicycle model
   delta = atan(wheelbase * yaw_rate / v)   (มี guard กันหารด้วยศูนย์)
 
@@ -28,8 +32,9 @@ Safety rules (diagram V2):
   1) e-stop (จาก 0x131)   -> enable=0, speed=0, brake=1
   2) /cmd_vel timeout      -> enable=0, speed=0, brake=1
   3) board fault/heartbeat -> enable=0, speed=0, brake=1
-  4) normal moving         -> brake=0, enable=1, speed=linear.x, /steering_cmd
-  5) normal zero command   -> enable=0, speed=0, brake follows brake_on_zero_cmd
+  4) /brake_cmd true       -> enable=0, speed=0, brake=1
+  5) normal moving         -> brake=0, enable=1, speed=linear.x, /steering_cmd
+  6) normal zero command   -> enable=0, speed=0, brake follows brake_on_zero_cmd
 
 Before running:
   sudo ip link set can0 up type can bitrate 250000
@@ -122,9 +127,11 @@ class RosCanBridge(Node):
         self.measured_speed = 0.0
         self.target_speed = 0.0
         self.last_brake_angle_cmd_deg = self.servo_stop_deg
+        self.manual_brake_active = False
 
         # ---------- ROS I/O ----------
         self.create_subscription(Twist, '/cmd_vel', self._cb_cmd_vel, 10)
+        self.create_subscription(Bool, '/brake_cmd', self._cb_brake_cmd, 10)
         self.create_subscription(Float32, '/servo_command', self._cb_brake_angle, 10)
         self.create_subscription(Float32, '/brake_angle_cmd', self._cb_brake_angle, 10)
         self.create_subscription(Float32, '/brake_servo_start_cmd', self._cb_servo_start, 10)
@@ -155,6 +162,13 @@ class RosCanBridge(Node):
     def _cb_cmd_vel(self, msg: Twist):
         self.cmd = msg
         self.last_cmd_stamp = self.get_clock().now()
+
+    def _cb_brake_cmd(self, msg: Bool):
+        active = bool(msg.data)
+        if active != self.manual_brake_active:
+            state = 'active' if active else 'released'
+            self.get_logger().info(f'manual /brake_cmd override {state}')
+        self.manual_brake_active = active
 
     def _cb_brake_angle(self, msg: Float32):
         angle = self._clamp_angle(msg.data)
@@ -190,6 +204,14 @@ class RosCanBridge(Node):
         # ---- step 4: สั่ง actuator ตาม condition ----
         if stop_required:
             # rules 1-3: หยุด + เบรก, steering ค้างมุมเดิม (ไม่ publish)
+            self._send_enable(0)
+            self._send_speed(0.0)
+            self._send_brake(1)
+            return
+
+        if self.manual_brake_active:
+            # Manual brake override for bench/hardware tests. Safety faults above
+            # still win; false simply returns control to the normal /cmd_vel path.
             self._send_enable(0)
             self._send_speed(0.0)
             self._send_brake(1)

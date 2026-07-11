@@ -92,6 +92,7 @@ ros2 run golfcart_low_level steering_node
 Inputs:
 
 - `/cmd_vel` (`geometry_msgs/msg/Twist`)
+- `/brake_cmd` (`std_msgs/msg/Bool`, manual brake override; `true = brake`, `false = return to /cmd_vel control`)
 
 Internal bridge-to-steering command:
 
@@ -148,3 +149,22 @@ ros2 topic echo /speed_diagnostics
 ros2 topic echo /brake_status
 ros2 topic echo /steering_angle
 ```
+
+## Brake Test
+
+Apply the manual brake override:
+
+```bash
+ros2 topic pub --once /brake_cmd std_msgs/msg/Bool "{data: true}"
+```
+
+Release the manual override:
+
+```bash
+ros2 topic pub --once /brake_cmd std_msgs/msg/Bool "{data: false}"
+```
+
+Keep `/cmd_vel` publishing while releasing. With the default
+`brake_on_zero_cmd: false`, zero `/cmd_vel` releases the brake after
+`/brake_cmd` is false. Safety states such as e-stop, board timeout, or speed
+fault still force the brake on.
