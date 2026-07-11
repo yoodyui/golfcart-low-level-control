@@ -8,6 +8,8 @@ ros_can_bridge:
     brake_cmd_can_id: 304          # 0x130
     brake_status_can_id: 305       # 0x131
     brake_servo_cmd_can_id: 306    # 0x132
+    brake_servo_start_deg: 180.0   # release angle, packed into 0x132 bytes 0..3
+    brake_servo_stop_deg: 110.0    # engage angle, packed into 0x132 bytes 4..7
     wheelbase_m: 1.65
     max_speed_mps: 5.0
     max_steering_deg: 50.0

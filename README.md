@@ -4,8 +4,7 @@ ROS 2 and STM32 firmware for a drive-by-wire golf cart low-level control layer.
 
 The Jetson Orin Nano runs the ROS 2 nodes and talks to the vehicle CAN bus through
 an InnoMaker USB2CAN adapter. The STM32G4 car-shield firmware in this repository
-controls the brake board. Speed commands/status are kept in the ROS bridge for a
-separate speed controller board on the same CAN bus. The KEYA steering motor is
+controls the brake and Curtis 1510 speed interface. The KEYA steering motor is
 driven directly from ROS 2 over extended CAN frames.
 
 ![Low-level control overview](docs/golfcart_low_level_control_overview.png)
@@ -17,7 +16,7 @@ driven directly from ROS 2 over extended CAN frames.
 ├── ros2_ws/
 │   └── src/golfcart_low_level/        # Jetson ROS 2 package
 ├── firmware/
-│   └── stm32_motorbrake_car_shield/   # STM32CubeIDE brake firmware
+│   └── stm32_motorbrake_car_shield/   # STM32CubeIDE brake + speed firmware
 └── docs/
     └── golfcart_low_level_control_overview.png
 ```
@@ -36,8 +35,7 @@ Jetson Orin Nano
 InnoMaker USB2CAN, SocketCAN can0, 250 kbit/s
      |
 CAN bus
-  - STM32G4 brake board, standard 11-bit IDs
-  - speed controller board, standard 11-bit IDs
+  - STM32G4 brake + speed board, standard 11-bit IDs
   - KEYA steering motor, extended 29-bit IDs
 ```
 
@@ -51,17 +49,22 @@ The user commands the cart only through `/cmd_vel`.
 
 ## CAN Protocol
 
-The brake-side protocol below matches the current
-`firmware/stm32_motorbrake_car_shield` project, synced from
-`AJYui_MotorBrakeModule-main/MotorBrake_Firmware_Car_Shield`. The bus is classic
-CAN, standard 11-bit IDs for STM32 frames, 250 kbit/s, so it can share the same
-physical bus with the KEYA steering motor.
+The protocol below matches `firmware/stm32_motorbrake_car_shield`, synced from
+`Downloads/GolfCart/Speed control/AJYui_MotorBrakeModule-Dev_dataloggerShield`.
+The bus is classic CAN, standard 11-bit IDs for STM32 frames, 250 kbit/s, so it
+can share the same physical bus with the KEYA steering motor.
 
 | CAN ID | Direction | DLC | Meaning |
 |---|---|---:|---|
+| `0x120` | Jetson to STM32 | 2 | target speed, `int16` little-endian, scale `0.01 m/s` |
+| `0x121` | Jetson to STM32 | 1 | speed enable, byte0 `0/1` |
+| `0x122` | STM32 to Jetson | 8 | speed status: measured/target speed, flags, fault code, sequence |
+| `0x123` | STM32 to Jetson | 8 | speed diagnostics: Curtis I/O flags, MCOR mV, speed sensor Hz |
 | `0x130` | Jetson to STM32 | 1 | brake command, byte0 `0 = release`, `1 = brake` |
 | `0x131` | STM32 to Jetson | 8 | brake status heartbeat |
-| `0x132` | Jetson to STM32 | 4 | brake engaged servo angle, one `float32` value in degrees |
+| `0x132` | Jetson to STM32 | 8 | servo command: `float32 start_deg`, `float32 stop_deg` |
+| `0x133` | STM32 to Jetson | 8 | servo status: `float32 start_deg`, `float32 stop_deg` |
+| `0x134` | STM32 to Jetson | 1 | current brake servo target angle in whole degrees |
 
 `0x131` payload:
 
@@ -69,17 +72,28 @@ physical bus with the KEYA steering motor.
 |---|---|
 | `0..3` | brake current in mA, `float32` little-endian |
 | `4` | relay active |
-| `5` | watchdog / e-stop / fault status, `0 = normal`, `1 = triggered` |
+| `5` | status bits: bit0 watchdog/fault latch, bit1 PC13 e-stop live |
 | `6..7` | sequence counter, `uint16` little-endian |
 
-The ROS bridge also keeps the speed-controller CAN frames below. They require a
-separate speed controller board/firmware on the same bus:
+`0x122` payload:
 
-| CAN ID | Direction | DLC | Meaning |
-|---|---|---:|---|
-| `0x120` | Jetson to speed controller | 2 | target speed, `int16` little-endian, scale `0.01 m/s` |
-| `0x121` | Jetson to speed controller | 1 | speed enable, byte0 `0/1` |
-| `0x122` | speed controller to Jetson | 2 | measured speed, `int16` little-endian, scale `0.01 m/s` |
+| Byte | Meaning |
+|---|---|
+| `0..1` | measured speed, `int16` little-endian, scale `0.01 m/s` |
+| `2..3` | target speed, `int16` little-endian, scale `0.01 m/s` |
+| `4` | status flags: bit0 enabled, bit1 fwd, bit2 rev, bit3 pedal, bit4 sensor valid, bit5 timeout, bit6 e-stop, bit7 fault |
+| `5` | fault code |
+| `6..7` | sequence counter, `uint16` little-endian |
+
+`0x123` payload:
+
+| Byte | Meaning |
+|---|---|
+| `0` | input flags: bit0 FWD, bit1 REV, bit2 Pedal |
+| `1` | output flags: bit0 FWD, bit1 REV, bit2 Pedal, bit3 mode relay |
+| `2..3` | MCOR input in mV, `uint16` little-endian |
+| `4..5` | MCOR output in mV, `uint16` little-endian |
+| `6..7` | speed sensor Hz, `uint16` little-endian |
 
 KEYA steering uses extended CAN IDs:
 
@@ -148,7 +162,10 @@ Expected CAN heartbeat/status frames:
 
 ```text
 can0  131   [8]  ...
-can0  122   [2]  ...   # only when the separate speed controller is present
+can0  122   [8]  ...
+can0  123   [8]  ...
+can0  133   [8]  ...
+can0  134   [1]  ...
 ```
 
 ## Run ROS 2 Low-Level Control
@@ -167,7 +184,10 @@ Useful status topics:
 ros2 topic echo /lowlevel_fault
 ros2 topic echo /e_stop_status
 ros2 topic echo /speed_status
+ros2 topic echo /speed_target
+ros2 topic echo /speed_diagnostics
 ros2 topic echo /brake_status
+ros2 topic echo /brake_angle
 ros2 topic echo /steering_angle
 ros2 topic echo /steering_fault
 ```
@@ -201,19 +221,23 @@ FDCAN clock: 170 MHz
 NominalPrescaler: 40
 NominalTimeSeg1: 13
 NominalTimeSeg2: 3
-NominalSyncJumpWidth: 1
+NominalSyncJumpWidth: 3
 Nominal bitrate: 250 kbit/s
 Sample point: 82.4%
-StdFiltersNbr: 2
+StdFiltersNbr: 4
 ```
 
-`StdFiltersNbr` is `2` because the brake firmware accepts `0x130` and `0x132`.
+`StdFiltersNbr` is overridden to `4` in `CAN_App_Init()` because the firmware
+accepts `0x130`, `0x132`, `0x120`, and `0x121`. The bit timing itself comes from
+the `.ioc`: `NominalPrescaler=40`, `NominalTimeSeg1=13`,
+`NominalTimeSeg2=3`, `NominalSyncJumpWidth=3`.
 
 E-stop behavior:
 
 ```text
 PD2 active-low, falling edge latches watchdog_status = 1
 PD2 is re-initialized with an internal pull-up in USER CODE
+PC13 E_Stop is also reported live in 0x131 bit1 and 0x122 bit6
 ```
 
 If the e-stop circuit is not wired yet, leave PD2 idle high/open so the internal
@@ -221,13 +245,15 @@ pull-up holds it inactive. A real e-stop input should pull PD2 low. Once latched
 the watchdog/e-stop status is reported in byte 5 of `0x131`.
 
 Build and flash the STM32 board from STM32CubeIDE. After flashing, the board
-should publish `0x131` periodically at about 20 ms.
+should publish the brake group (`0x131`, `0x133`, `0x134`) and speed group
+(`0x122`, `0x123`) periodically.
 
 ## Safety Behavior
 
 The bridge commands a safe state when any of these conditions is true:
 
 - e-stop/fault byte from STM32 `0x131` is active
+- speed timeout/fault flags from STM32 `0x122` are active
 - `/cmd_vel` timeout
 - STM32 heartbeat timeout
 
@@ -247,7 +273,7 @@ Jetson/ROS layer is supervision and command arbitration, not the only safety pat
 
 No `0x131` in `candump can0`:
 
-- Confirm Jetson, STM32 brake board, speed controller, and KEYA steering are all at 250 kbit/s.
+- Confirm Jetson, STM32 brake/speed board, and KEYA steering are all at 250 kbit/s.
 - Check CAN_H/CAN_L polarity.
 - Check 120 ohm termination at both ends of the bus.
 - Check CAN transceiver power and common ground/reference.

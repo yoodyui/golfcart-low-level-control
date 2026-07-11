@@ -31,14 +31,22 @@ The included helper script does the same setup:
 bash ~/GolfCart/golfcart-low-level-control/ros2_ws/src/golfcart_low_level/scripts/setup_can0.sh can0 250000
 ```
 
-All CAN nodes on the same physical bus must use the same bitrate. The brake
-firmware, separate speed controller, KEYA steering motor, and Jetson CAN
-interface should all be set to 250 kbit/s.
+All CAN nodes on the same physical bus must use the same bitrate. The STM32
+brake/speed firmware, KEYA steering motor, and Jetson CAN interface should all
+be set to 250 kbit/s.
 
-The STM32 firmware in `firmware/stm32_motorbrake_car_shield` is brake-only:
-`0x130` brake command, `0x131` brake status, and `0x132` brake servo angle. The
-speed frames `0x120`, `0x121`, and `0x122` require a separate speed controller
-board/firmware on the same CAN bus.
+The STM32 firmware in `firmware/stm32_motorbrake_car_shield` handles both brake
+and speed/Curtis I/O:
+
+- `0x120` speed command
+- `0x121` speed enable
+- `0x122` speed status
+- `0x123` speed diagnostics
+- `0x130` brake command
+- `0x131` brake status
+- `0x132` servo start/stop command
+- `0x133` servo status
+- `0x134` brake angle
 
 ## Build On Jetson
 
@@ -93,17 +101,26 @@ Status outputs:
 
 - `/e_stop_status`
 - `/lowlevel_fault`
-- `/speed_status` (requires the separate speed controller frame `0x122`)
+- `/speed_status`
+- `/speed_target`
+- `/speed_status_flags`
+- `/speed_fault_code`
+- `/speed_sequence`
+- `/speed_diagnostics`
 - `/brake_status`
 - `/brake_current`
 - `/brake_sequence`
+- `/brake_angle`
+- `/servo_status`
 - `/steering_angle`
 - `/steering_fault`
 
 Brake servo angle command:
 
-- `/servo_command` (`std_msgs/msg/Float32`, brake engaged angle in degrees, sent as CAN `0x132`)
-- `/brake_angle_cmd` (`std_msgs/msg/Float32`, alias for the same CAN `0x132` command)
+- `/servo_command` (`std_msgs/msg/Float32`, updates brake engaged/stop angle; bridge sends CAN `0x132` as start+stop float32 pair)
+- `/brake_angle_cmd` (`std_msgs/msg/Float32`, alias for engaged/stop angle)
+- `/brake_servo_start_cmd` (`std_msgs/msg/Float32`, updates release/start angle)
+- `/brake_servo_stop_cmd` (`std_msgs/msg/Float32`, updates engaged/stop angle)
 
 ## Quick Test
 
@@ -126,5 +143,8 @@ Watch status:
 ```bash
 ros2 topic echo /lowlevel_fault
 ros2 topic echo /e_stop_status
+ros2 topic echo /speed_status
+ros2 topic echo /speed_diagnostics
+ros2 topic echo /brake_status
 ros2 topic echo /steering_angle
 ```
