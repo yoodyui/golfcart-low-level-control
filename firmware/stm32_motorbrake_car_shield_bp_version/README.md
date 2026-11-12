@@ -17,12 +17,13 @@
 ## ฮาร์ดแวร์ที่ต้องเตรียมก่อนแฟลช
 
 ดูรูป: [`docs/bp_version/motorbrake_board_annotated.png`](../../docs/bp_version/motorbrake_board_annotated.png),
-[`docs/bp_version/logger_shield_annotated.png`](../../docs/bp_version/logger_shield_annotated.png)
+[`docs/bp_version/logger_shield_annotated.png`](../../docs/bp_version/logger_shield_annotated.png),
+[`docs/bp_version/estop_wiring.png`](../../docs/bp_version/estop_wiring.png) (วิธีต่อปุ่ม E-Stop)
 
 | จุด | ทำอะไร | ถ้าไม่ทำ |
 |---|---|---|
 | **CN3 EMER** (บอร์ดล่าง) | เสียบจัมเปอร์ค้างไว้ | เซอร์โวไม่มีไฟ เบรกใช้ไม่ได้ |
-| **PC13** = J2 ขา 7 บน Logger Shield (แถวขาคี่ ช่องที่ 4 นับจากขา 1 = +5V) | ต่อหน้าสัมผัส **NC** ของปุ่ม E-Stop ไปลง GND (ทดสอบบนโต๊ะ: จัมเปอร์ PC13 ลง GND) | ระบบถือว่ากด E-Stop ค้าง → **เบรกดึงค้าง + ตัดคันเร่ง รถขยับไม่ได้** |
+| **PC13** = ขา 7 ของ AUX_PORT (= J2 ขา 7 บน Logger Shield; คอลัมน์ขาคี่ ขาที่ 4 นับจากขา 1 = +5V) | ต่อหน้าสัมผัส **NC** (ขั้ว 11-12) ของปุ่ม E-Stop ระหว่างขา 7 กับ GND (ขา 2 หรือ 4) ไม่ต้องใส่ตัวต้านทาน (ทดสอบบนโต๊ะ: จัมเปอร์ PC13 ลง GND) | ระบบถือว่ากด E-Stop ค้าง → **เบรกดึงค้าง + ตัดคันเร่ง รถขยับไม่ได้** |
 | **J4 Mode_Selector** (Logger Shield, JST-XH 2 ขา ข้าง CAR_SIGNAL_IN) | สวิตช์โยกคร่อมขา 1 (PC9) – ขา 2 (GND) | ไม่ต่อ = MANUAL ตลอด (ใช้ AUTO ไม่ได้) |
 
 > ⚠️ โฟลเดอร์ `../stm32_motorbrake_car_shield` (เวอร์ชันเก่าใน repo) ตั้ง PC13 เป็น active-low
