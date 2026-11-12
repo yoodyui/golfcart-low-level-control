@@ -16,7 +16,8 @@ driven directly from ROS 2 over extended CAN frames.
 ├── ros2_ws/
 │   └── src/golfcart_low_level/        # Jetson ROS 2 package
 ├── firmware/
-│   └── stm32_motorbrake_car_shield/   # STM32CubeIDE brake + speed firmware
+│   ├── stm32_motorbrake_car_shield/   # STM32CubeIDE brake + speed firmware
+│   └── stm32_motorbrake_car_shield_bp_version/  # safety-fixed version (manual/auto switch, E-Stop) — see its README
 └── docs/
     └── golfcart_low_level_control_overview.png
 ```
