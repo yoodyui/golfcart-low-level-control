@@ -238,6 +238,14 @@
  *        E-Stop), never drives the Curtis outputs, and ignores /speed_enable,
  *        /brake_command and the PC1 button. */
 #define MODE_MANUAL_LEVEL         GPIO_PIN_SET
+/* USE_MODE_SELECTOR 0 (default): J4/PC9 is NOT read — ROS chooses the mode as
+ *   in the original firmware (/speed_enable=1 -> AUTO, 0 -> MANUAL pass-
+ *   through). mode_manual stays 0 so /brake_command and the PC1 button work
+ *   at any time. The safety fixes (auto-brake only with speed_enable + fresh
+ *   cmd_vel, driver takeover, cmd_vel-timeout brake, E-Stop) still apply.
+ * USE_MODE_SELECTOR 1: the J4 switch is a hardware interlock (open = MANUAL
+ *   lock-out, closed = AUTO allowed), as described above. */
+#define USE_MODE_SELECTOR         0
 #define MODE_DEBOUNCE_MS          50u
 
 /* [BP-2] Driver takeover in AUTO: if the driver presses the accelerator
@@ -458,8 +466,12 @@ int main(void)
 	HAL_GPIO_Init(E_Stop_GPIO_Port, &pc13_init);
 
 	/* [BP-1] Read the mode switch once at boot (no debounce needed here). */
+#if USE_MODE_SELECTOR
 	mode_manual = (HAL_GPIO_ReadPin(MODE_Selector_GPIO_Port, MODE_Selector_Pin)
 			== MODE_MANUAL_LEVEL) ? 1u : 0u;
+#else
+	mode_manual = 0;   /* [BP-1] J4 ignored: ROS /speed_enable selects the mode */
+#endif
 
 	/* Recall the start/stop angles saved by the last /servo_command (defaults if
 	 * the flash page was never written). */
@@ -534,6 +546,7 @@ int main(void)
 
 		/* [BP-1] Mode selector (PC9), debounced. Any change of mode drops every
 		 * autonomous command; ROS must re-send /speed_enable and /cmd_vel. */
+#if USE_MODE_SELECTOR
 		{
 			static uint8_t  mode_raw_prev    = 0xFFu;
 			static uint32_t mode_change_tick = 0;
@@ -553,6 +566,9 @@ int main(void)
 				driver_takeover         = 0;
 			}
 		}
+#else
+		mode_manual = 0;   /* J4 not used (USE_MODE_SELECTOR 0) */
+#endif
 		if (mode_manual) {
 			/* MANUAL: nothing autonomous may drive the car or the brake. */
 			speed_control_enable   = 0;
