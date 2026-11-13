@@ -1,7 +1,7 @@
 # MotorBrake_Firmware_Car_Shield_bp_version — สิ่งที่แก้ (12 พ.ย. 2026)
 
 คัดลอกจาก `MotorBrake_Firmware_Car_Shield` (ไม่รวม Debug/) แก้เฉพาะ `Core/Src/main.c`
-ค้นหา `[BP-` ในไฟล์เพื่อดูทุกจุดที่แก้ (ต้องเจอ 29 บรรทัด — ถ้า Generate Code จาก .ioc แล้วเหลือน้อยกว่านี้ แปลว่าโค้ดหาย) ชื่อโปรเจกต์ใน CubeIDE = `MotorBrake_Firmware_Car_Shield_bp_version`
+ค้นหา `[BP-` ในไฟล์เพื่อดูทุกจุดที่แก้ (ต้องเจอ 33 บรรทัด — ถ้า Generate Code จาก .ioc แล้วเหลือน้อยกว่านี้ แปลว่าโค้ดหาย) ชื่อโปรเจกต์ใน CubeIDE = `MotorBrake_Firmware_Car_Shield_bp_version`
 คอมไพล์และลิงก์ผ่าน (arm-none-eabi-gcc 13.2) — text 45.0 kB
 
 | รหัส | แก้อะไร |
@@ -9,6 +9,7 @@
 | BP-1 | **ค่าเริ่มต้น `USE_MODE_SELECTOR 0` = ไม่อ่าน J4, ROS เลือกโหมดด้วย /speed_enable เหมือนเดิม.** ถ้าตั้ง 1: อ่านสวิตช์ Mode_Selector (J4→PC9): **เปิด = MANUAL (HIGH)**, **ปิดลง GND = AUTO (LED D11 ติด)**. MANUAL: ไม่ขยับเบรก (ยกเว้น E-Stop PC13), ไม่ขับ Curtis, ไม่รับ /speed_enable, /brake_command, ปุ่ม PC1. สลับโหมดเมื่อไหร่ ล้างคำสั่ง auto ทั้งหมด |
 | BP-1/3 | auto-brake ทำงานเฉพาะ AUTO + speed_control_enable + cmd_vel สด (เดิมทำงานแม้ขับแมนนวล) |
 | BP-2 | Driver takeover: AUTO แล้วคนขับเหยียบคันเร่ง ≥50 ms → ปิด speed control, ปล่อยเบรก, latch จนกว่าจะได้ /speed_enable=0 หรือสลับสวิตช์โหมด |
+| BP-8 | Takeover ทำงานทุกครั้งที่เหยียบคันเร่ง (ไม่ใช่แค่ตอน speed control ทำงาน) → ไม่รับ /brake_command และ /speed_enable=1 จาก ROS. /speed_enable=0 ไม่ล้าง takeover อีกแล้ว (bridge ส่ง 0 ทุก 20 ms ตอนไม่มี cmd_vel). ล้างได้ด้วย /speed_enable 0→1 หลังปล่อยคันเร่ง ≥ 1 s (`TAKEOVER_REARM_MS`) หรือสลับโหมด. ปุ่ม SW ใช้ไม่ได้ระหว่าง takeover |
 | BP-3 | cmd_vel ขาด >500 ms ขณะ AUTO+enable → target 0 และเบรกค้างไว้ (ทำบน STM32 เอง) |
 | BP-4 | PC13 ใส่ pull-down (ขาไม่ได้ต่อ เดิมลอยแล้วสั่งเบรกเองได้); E-Stop ใช้มุม stop ที่คาลิเบรต |
 | BP-5 | Overcurrent แล้วห้ามเบรกซ้ำ 2 s (กันรีเลย์ตัด-ต่อรัวๆ) |

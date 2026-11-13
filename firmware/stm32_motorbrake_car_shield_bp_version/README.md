@@ -42,7 +42,7 @@
 |---|---|
 | `/speed_enable = false` (หรือยังไม่ส่ง) | **MANUAL**: คันเร่งจากแป้นผ่านไป Curtis ตรง, auto-brake ไม่ทำงาน (เบรกขยับเฉพาะ `/brake_command`, ปุ่ม SW, E-Stop) |
 | `/speed_enable = true` | **AUTO**: MCU คุมคันเร่ง/ทิศทาง ตาม `/cmd_vel` |
-| AUTO แล้วคนขับเหยียบคันเร่ง ≥ 50 ms | Driver takeover: ปิด speed control, ปล่อยเบรก, ค้างจนได้ `/speed_enable=0` หรือสลับสวิตช์โหมด |
+| คนขับเหยียบคันเร่ง ≥ 50 ms (ทุกเวลา ยกเว้น E-Stop) | Driver takeover: ปิด speed control, **ไม่รับคำสั่งเบรก/enable จาก ROS** → เบรกปล่อย ขับเองได้. กลับเป็น AUTO ได้เมื่อปล่อยคันเร่ง ≥ 1 s แล้ว ROS ส่ง `/speed_enable` 0 → 1 ใหม่ (bridge ทำเองเมื่อ `/cmd_vel` เปลี่ยนจาก 0 เป็นค่าไม่ใช่ 0) |
 | AUTO + enable แต่ `/cmd_vel` ขาด > 500 ms | ตั้งความเร็ว 0 และดึงเบรก |
 | กด E-Stop (หรือสายขาด) | ดึงเบรก + ตัดคันเร่งคนขับ + ปิด AUTO (ทุกโหมด) |
 | ปล่อย E-Stop ค้าง 200 ms | ปล่อยเบรก คันเร่งกลับมาให้คนขับ (AUTO ต้อง enable ใหม่) |
@@ -55,7 +55,7 @@ CAN 0x123 byte 0 เพิ่มบิต: bit3 manual, bit4 takeover, bit5 cmd_
    (ชื่อโปรเจกต์ `MotorBrake_Firmware_Car_Shield_bp_version` เปิดคู่กับโปรเจกต์เดิมได้)
 2. กด **Build** (ค้อน) → ต่อ ST-Link → **Run**
 3. **ไม่ต้อง/อย่า** เปิด `.ioc` แล้ว Generate Code. ถ้าถูกถาม "generate code?" ให้ตอบ **No**.
-   ถ้าจำเป็นต้อง Generate ให้เช็กว่า `grep -c "BP-" Core/Src/main.c` ยังได้ 29
+   ถ้าจำเป็นต้อง Generate ให้เช็กว่า `grep -c "BP-" Core/Src/main.c` ยังได้ 33
 
 ## ทดสอบบนโต๊ะ (ยกล้อขึ้นก่อนเสมอ) — ดูค่าใน Live Expressions
 
@@ -64,4 +64,4 @@ CAN 0x123 byte 0 เพิ่มบิต: bit3 manual, bit4 takeover, bit5 cmd_
 - [ ] `curtis_pedal` = 1 ตอนเหยียบคันเร่ง (ถ้าได้ 0 ให้แก้ `PEDAL_PRESSED_LEVEL` เป็น `0u`)
 - [ ] MANUAL: เหยียบคันเร่งให้ล้อหมุน — เบรกต้องไม่ขยับ
 - [ ] AUTO: ส่ง `/speed_enable=true` + `/cmd_vel` แล้วหยุดส่ง `/cmd_vel` — ภายใน 0.5 s ต้องเบรก
-- [ ] AUTO ระหว่างวิ่ง: เหยียบคันเร่ง — `driver_takeover` = 1, ล้อกลับมาตามคันเร่งคนขับ
+- [ ] AUTO ระหว่างวิ่ง หรือตอน bridge สั่งเบรกค้าง (ไม่มี `/cmd_vel`): เหยียบคันเร่ง — `driver_takeover` = 1, เบรกปล่อย, ล้อตามคันเร่งคนขับ

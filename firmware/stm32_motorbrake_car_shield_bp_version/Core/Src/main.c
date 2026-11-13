@@ -258,6 +258,13 @@
 #define ENABLE_PEDAL_TAKEOVER     1
 #define PEDAL_PRESSED_LEVEL       1u
 #define PEDAL_DEBOUNCE_MS         50u
+/* [BP-8] Takeover now fires whenever the driver presses the accelerator (not
+ *        only while speed control runs): ROS brake/enable commands are then
+ *        ignored, so a bridge that keeps sending brake=1 on cmd_vel timeout
+ *        cannot hold the brake against the driver. The latch clears only on a
+ *        /speed_enable 0 -> 1 transition after the pedal has been released for
+ *        TAKEOVER_REARM_MS (i.e. autonomy is explicitly restarted). */
+#define TAKEOVER_REARM_MS         1000u
 
 /* [BP-3] /cmd_vel timeout handled on the STM32 itself: in AUTO with speed
  *        control enabled, no fresh 0x120 for SPEED_CMD_TIMEOUT_MS -> target 0
@@ -354,7 +361,9 @@ volatile float   auto_brake_speed_thresh_mps = AUTO_BRAKE_SPEED_THRESH_DEFAULT;
 
 /* --- bp_version state (all visible in Live Expressions) --- */
 volatile uint8_t  mode_manual       = 1;  // 1 = MANUAL (PC9 HIGH), 0 = AUTO. Read at boot, then debounced
-volatile uint8_t  driver_takeover   = 0;  // 1 = driver pressed the pedal in AUTO; latched (see BP-2)
+volatile uint8_t  driver_takeover   = 0;  // 1 = driver pressed the accelerator; latched (see BP-2/8)
+volatile uint32_t pedal_released_since = 0; // [BP-8] tick the pedal was released (0 = pressed / unknown)
+volatile uint8_t  last_rx_enable    = 0;  // [BP-8] last /speed_enable value, for 0 -> 1 edge detection
 volatile uint8_t  cmd_timeout_brake = 0;  // 1 = AUTO + enabled + /cmd_vel stale -> braking (BP-3)
 volatile uint8_t  brake_oc_lockout  = 0;  // 1 = overcurrent tripped, brake re-engage blocked (BP-5)
 volatile uint8_t  wdi_kick_flag     = 0;  // set by TIM6, consumed by the main loop (BP-6)
@@ -577,11 +586,16 @@ int main(void)
 		}
 
 #if ENABLE_PEDAL_TAKEOVER
-		/* [BP-2] Driver takeover: accelerator pressed while AUTO is driving. */
+		/* [BP-2/8] Driver takeover: accelerator pressed (any time, E-Stop excepted). */
 		{
 			static uint32_t pedal_on_since = 0;   /* 0 = not pressed */
 			uint8_t pedal_now = (CurtisIO_Pedal() == PEDAL_PRESSED_LEVEL) ? 1u : 0u;
-			if (!mode_manual && speed_control_enable && pedal_now) {
+			if (pedal_now) {
+				pedal_released_since = 0;
+			} else if (pedal_released_since == 0u) {
+				pedal_released_since = (now_ms != 0u) ? now_ms : 1u;
+			}
+			if (!estop_pc13 && pedal_now) {
 				if (pedal_on_since == 0u) {
 					pedal_on_since = (now_ms != 0u) ? now_ms : 1u;
 				}
@@ -1159,16 +1173,27 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 			/* [BP-1/2] enable=0 always accepted (and re-arms after a takeover).
 			 * enable=1 refused in MANUAL, while a takeover is latched, or while
 			 * the driver is still pressing the accelerator. */
-			if (RxData[0] == 0u) {
+			/* [BP-8] enable=0 no longer clears a takeover (the bridge sends it at
+			 * 50 Hz whenever cmd_vel is 0/stale). Only a 0 -> 1 edge with the
+			 * pedal released for TAKEOVER_REARM_MS re-arms AUTO. */
+			uint8_t en = (RxData[0] != 0u) ? 1u : 0u;
+			if (!en) {
 				speed_control_enable = 0;
-				driver_takeover      = 0;
-			} else if (!mode_manual && !driver_takeover
+			} else if (!mode_manual) {
+				if (driver_takeover && !last_rx_enable
+						&& pedal_released_since != 0u
+						&& (HAL_GetTick() - pedal_released_since) >= TAKEOVER_REARM_MS) {
+					driver_takeover = 0;
+				}
+				if (!driver_takeover
 #if ENABLE_PEDAL_TAKEOVER
-					&& CurtisIO_Pedal() != PEDAL_PRESSED_LEVEL
+						&& CurtisIO_Pedal() != PEDAL_PRESSED_LEVEL
 #endif
-					) {
-				speed_control_enable = 1;
+						) {
+					speed_control_enable = 1;
+				}
 			}
+			last_rx_enable = en;
 		} else if (RxHeader.Identifier == CAN_ID_SERVO_CMD) {
 			/* 8-byte: [0..3] start_deg, [4..7] stop_deg. Takes effect immediately;
 			 * the flash persist is debounced in the main loop (FLASH_WRITE_QUIET_MS). */
