@@ -9,6 +9,12 @@
 - รายละเอียดการแก้แต่ละข้อ: [`CHANGES_BP.md`](CHANGES_BP.md)
 - คอมไพล์และลิงก์ผ่าน (arm-none-eabi-gcc 13.2) — **ยังไม่ได้ทดสอบบนรถจริง**
 
+## โหมด MANUAL / AUTO
+
+ค่าเริ่มต้น `#define USE_MODE_SELECTOR 0` (ใน `main.c`): **ไม่อ่านสวิตช์ J4** — ROS เป็นคนเลือกโหมดเหมือนเฟิร์มแวร์เดิม
+(`/speed_enable`). ถ้าต้องการสวิตช์จริงกันไว้อีกชั้น ให้ตั้งเป็น `1` แล้วต่อสวิตช์ที่ J4
+(เปิด/ไม่ต่อ = ล็อก MANUAL, ปิด = อนุญาต AUTO, ไฟ D11 ติด)
+
 ## ปัญหาที่แก้
 
 เฟิร์มแวร์เดิม: เมื่อ ROS เคยส่ง `/cmd_vel = 0` แม้ครั้งเดียว ถ้าคนขับขับเองแล้วล้อหมุนเกิน 0.05 m/s
@@ -17,13 +23,14 @@
 ## ฮาร์ดแวร์ที่ต้องเตรียมก่อนแฟลช
 
 ดูรูป: [`docs/bp_version/motorbrake_board_annotated.png`](../../docs/bp_version/motorbrake_board_annotated.png),
-[`docs/bp_version/logger_shield_annotated.png`](../../docs/bp_version/logger_shield_annotated.png)
+[`docs/bp_version/logger_shield_annotated.png`](../../docs/bp_version/logger_shield_annotated.png),
+[`docs/bp_version/estop_wiring.png`](../../docs/bp_version/estop_wiring.png) (วิธีต่อปุ่ม E-Stop)
 
 | จุด | ทำอะไร | ถ้าไม่ทำ |
 |---|---|---|
 | **CN3 EMER** (บอร์ดล่าง) | เสียบจัมเปอร์ค้างไว้ | เซอร์โวไม่มีไฟ เบรกใช้ไม่ได้ |
-| **PC13** = J2 ขา 7 บน Logger Shield (แถวขาคี่ ช่องที่ 4 นับจากขา 1 = +5V) | ต่อหน้าสัมผัส **NC** ของปุ่ม E-Stop ไปลง GND (ทดสอบบนโต๊ะ: จัมเปอร์ PC13 ลง GND) | ระบบถือว่ากด E-Stop ค้าง → **เบรกดึงค้าง + ตัดคันเร่ง รถขยับไม่ได้** |
-| **J4 Mode_Selector** (Logger Shield, JST-XH 2 ขา ข้าง CAR_SIGNAL_IN) | สวิตช์โยกคร่อมขา 1 (PC9) – ขา 2 (GND) | ไม่ต่อ = MANUAL ตลอด (ใช้ AUTO ไม่ได้) |
+| **PC13** = ขา 7 ของ AUX_PORT (= J2 ขา 7 บน Logger Shield; คอลัมน์ขาคี่ ขาที่ 4 นับจากขา 1 = +5V) | ต่อหน้าสัมผัส **NC** (ขั้ว 11-12) ของปุ่ม E-Stop ระหว่างขา 7 กับ GND (ขา 2 หรือ 4) ไม่ต้องใส่ตัวต้านทาน (ทดสอบบนโต๊ะ: จัมเปอร์ PC13 ลง GND) | ระบบถือว่ากด E-Stop ค้าง → **เบรกดึงค้าง + ตัดคันเร่ง รถขยับไม่ได้** |
+| **J4 Mode_Selector** (Logger Shield) | **ค่าเริ่มต้นไม่ต้องต่อ** (`USE_MODE_SELECTOR 0`) | — |
 
 > ⚠️ โฟลเดอร์ `../stm32_motorbrake_car_shield` (เวอร์ชันเก่าใน repo) ตั้ง PC13 เป็น active-low
 > (ปกติ HIGH, กด = LOW). bp_version ใช้แบบ NC ลง GND (ปกติ LOW, กดหรือสายขาด = HIGH).
@@ -33,9 +40,9 @@
 
 | สถานการณ์ | ผล |
 |---|---|
-| สวิตช์ J4 เปิด / ไม่ต่อ | **MANUAL**: เบรกไม่ขยับเอง, ไม่ขับ Curtis, ไม่รับ `/speed_enable`, `/brake_command`, ปุ่ม SW |
-| สวิตช์ J4 ปิด (ไฟ D11 ติด) | **AUTO**: รับคำสั่งจาก ROS ตามปกติ |
-| AUTO แล้วคนขับเหยียบคันเร่ง ≥ 50 ms | Driver takeover: ปิด speed control, ปล่อยเบรก, ค้างจนได้ `/speed_enable=0` หรือสลับสวิตช์โหมด |
+| `/speed_enable = false` (หรือยังไม่ส่ง) | **MANUAL**: คันเร่งจากแป้นผ่านไป Curtis ตรง, auto-brake ไม่ทำงาน (เบรกขยับเฉพาะ `/brake_command`, ปุ่ม SW, E-Stop) |
+| `/speed_enable = true` | **AUTO**: MCU คุมคันเร่ง/ทิศทาง ตาม `/cmd_vel` |
+| คนขับเหยียบคันเร่ง ≥ 50 ms (ทุกเวลา ยกเว้น E-Stop) | Driver takeover: ปิด speed control, **ไม่รับคำสั่งเบรก/enable จาก ROS** → เบรกปล่อย ขับเองได้. กลับเป็น AUTO ได้เมื่อปล่อยคันเร่ง ≥ 1 s แล้ว ROS ส่ง `/speed_enable` 0 → 1 ใหม่ (bridge ทำเองเมื่อ `/cmd_vel` เปลี่ยนจาก 0 เป็นค่าไม่ใช่ 0) |
 | AUTO + enable แต่ `/cmd_vel` ขาด > 500 ms | ตั้งความเร็ว 0 และดึงเบรก |
 | กด E-Stop (หรือสายขาด) | ดึงเบรก + ตัดคันเร่งคนขับ + ปิด AUTO (ทุกโหมด) |
 | ปล่อย E-Stop ค้าง 200 ms | ปล่อยเบรก คันเร่งกลับมาให้คนขับ (AUTO ต้อง enable ใหม่) |
@@ -48,13 +55,13 @@ CAN 0x123 byte 0 เพิ่มบิต: bit3 manual, bit4 takeover, bit5 cmd_
    (ชื่อโปรเจกต์ `MotorBrake_Firmware_Car_Shield_bp_version` เปิดคู่กับโปรเจกต์เดิมได้)
 2. กด **Build** (ค้อน) → ต่อ ST-Link → **Run**
 3. **ไม่ต้อง/อย่า** เปิด `.ioc` แล้ว Generate Code. ถ้าถูกถาม "generate code?" ให้ตอบ **No**.
-   ถ้าจำเป็นต้อง Generate ให้เช็กว่า `grep -c "BP-" Core/Src/main.c` ยังได้ 28
+   ถ้าจำเป็นต้อง Generate ให้เช็กว่า `grep -c "BP-" Core/Src/main.c` ยังได้ 33
 
 ## ทดสอบบนโต๊ะ (ยกล้อขึ้นก่อนเสมอ) — ดูค่าใน Live Expressions
 
-- [ ] `mode_manual` = 1 เมื่อสวิตช์ J4 เปิด, = 0 เมื่อปิด
+- [ ] (ถ้าตั้ง `USE_MODE_SELECTOR 1`) `mode_manual` = 1 เมื่อสวิตช์ J4 เปิด, = 0 เมื่อปิด
 - [ ] `estop_pc13` = 0 ปกติ, = 1 ตอนกดปุ่ม — เบรกดึง; ปล่อยปุ่มแล้วเบรกคลาย
 - [ ] `curtis_pedal` = 1 ตอนเหยียบคันเร่ง (ถ้าได้ 0 ให้แก้ `PEDAL_PRESSED_LEVEL` เป็น `0u`)
 - [ ] MANUAL: เหยียบคันเร่งให้ล้อหมุน — เบรกต้องไม่ขยับ
 - [ ] AUTO: ส่ง `/speed_enable=true` + `/cmd_vel` แล้วหยุดส่ง `/cmd_vel` — ภายใน 0.5 s ต้องเบรก
-- [ ] AUTO ระหว่างวิ่ง: เหยียบคันเร่ง — `driver_takeover` = 1, ล้อกลับมาตามคันเร่งคนขับ
+- [ ] AUTO ระหว่างวิ่ง หรือตอน bridge สั่งเบรกค้าง (ไม่มี `/cmd_vel`): เหยียบคันเร่ง — `driver_takeover` = 1, เบรกปล่อย, ล้อตามคันเร่งคนขับ
