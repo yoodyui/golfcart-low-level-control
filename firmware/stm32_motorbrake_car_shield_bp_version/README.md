@@ -45,7 +45,7 @@
 | คนขับเหยียบคันเร่ง ≥ 50 ms (ทุกเวลา ยกเว้น E-Stop) | Driver takeover: ปิด speed control, **ไม่รับคำสั่งเบรก/enable จาก ROS** → เบรกปล่อย ขับเองได้. กลับเป็น AUTO ได้เมื่อปล่อยคันเร่ง ≥ 1 s แล้ว ROS ส่ง `/speed_enable` 0 → 1 ใหม่ (bridge ทำเองเมื่อ `/cmd_vel` เปลี่ยนจาก 0 เป็นค่าไม่ใช่ 0) |
 | AUTO + enable แต่ `/cmd_vel` ขาด > 500 ms | ตั้งความเร็ว 0 และดึงเบรก |
 | กด E-Stop (หรือสายขาด) | ดึงเบรก + ตัดคันเร่งคนขับ + ปิด AUTO (ทุกโหมด) |
-| ปล่อย E-Stop ค้าง 200 ms | ปล่อยเบรก คันเร่งกลับมาให้คนขับ (AUTO ต้อง enable ใหม่) |
+| ปล่อย E-Stop ค้าง 200 ms | **เข้า MANUAL ทันที** (BP-9): ปล่อยเบรก, คันเร่งกลับมาที่คนขับ, bridge เลิกสั่งพวงมาลัย (`/control_mode = MANUAL`) แม้ nav ยังส่ง `/cmd_vel` อยู่. กลับ AUTO: `ros2 topic pub --once /auto_engage std_msgs/msg/Bool "{data: true}"` (หรือตั้ง `auto_resume_after_estop: true` ใน yaml ให้กลับ AUTO เอง) |
 
 CAN 0x123 byte 0 เพิ่มบิต: bit3 manual, bit4 takeover, bit5 cmd_vel-timeout brake, bit6 overcurrent lockout
 
@@ -55,7 +55,7 @@ CAN 0x123 byte 0 เพิ่มบิต: bit3 manual, bit4 takeover, bit5 cmd_
    (ชื่อโปรเจกต์ `MotorBrake_Firmware_Car_Shield_bp_version` เปิดคู่กับโปรเจกต์เดิมได้)
 2. กด **Build** (ค้อน) → ต่อ ST-Link → **Run**
 3. **ไม่ต้อง/อย่า** เปิด `.ioc` แล้ว Generate Code. ถ้าถูกถาม "generate code?" ให้ตอบ **No**.
-   ถ้าจำเป็นต้อง Generate ให้เช็กว่า `grep -c "BP-" Core/Src/main.c` ยังได้ 33
+   ถ้าจำเป็นต้อง Generate ให้เช็กว่า `grep -c "BP-" Core/Src/main.c` ยังได้ 40
 
 ## ทดสอบบนโต๊ะ (ยกล้อขึ้นก่อนเสมอ) — ดูค่าใน Live Expressions
 

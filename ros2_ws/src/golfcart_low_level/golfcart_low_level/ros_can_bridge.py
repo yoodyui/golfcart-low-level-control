@@ -35,6 +35,14 @@ Safety rules (diagram V2):
   4) /brake_cmd true       -> enable=0, speed=0, brake=1
   5) normal moving         -> brake=0, enable=1, speed=linear.x, /steering_cmd
   6) normal zero command   -> enable=0, speed=0, brake follows brake_on_zero_cmd
+  7) MANUAL (firmware 0x123 byte0 bit4: driver pressed the accelerator, or the
+     E-Stop was just released) -> brake=0, speed=0, NO 0x121 and NO
+     /steering_cmd, so the driver has throttle, brake pedal and steering.
+     /control_mode = MANUAL. Back to AUTO: publish /auto_engage (Bool true);
+     the bridge sends speed_enable 0 then 1, which the firmware needs to
+     leave MANUAL (pedal must be released for >= 1 s).
+     auto_resume_after_estop:=true makes the bridge do this by itself right
+     after the E-Stop is released.
 
 Before running:
   sudo ip link set can0 up type can bitrate 250000
@@ -93,6 +101,9 @@ class RosCanBridge(Node):
         self.declare_parameter('min_speed_for_steering_mps', 0.1)
         # false = startup/idle cmd_vel zero releases brake; true = zero command holds brake.
         self.declare_parameter('brake_on_zero_cmd', False)
+        # True = go straight back to AUTO when the E-Stop is released (sends the
+        # re-arm edge automatically). False = stay MANUAL until /auto_engage.
+        self.declare_parameter('auto_resume_after_estop', False)
 
         ch          = self.get_parameter('can_channel').value
         self.can_bitrate = int(self.get_parameter('can_bitrate').value)
@@ -109,6 +120,7 @@ class RosCanBridge(Node):
         self.max_steer = math.radians(self.get_parameter('max_steering_deg').value)
         self.min_v     = self.get_parameter('min_speed_for_steering_mps').value
         self.brake_on_zero_cmd = bool(self.get_parameter('brake_on_zero_cmd').value)
+        self.auto_resume_after_estop = bool(self.get_parameter('auto_resume_after_estop').value)
 
         # ---------- CAN ----------
         self.bus = can.Bus(channel=ch, interface='socketcan')
@@ -128,10 +140,17 @@ class RosCanBridge(Node):
         self.target_speed = 0.0
         self.last_brake_angle_cmd_deg = self.servo_stop_deg
         self.manual_brake_active = False
+        self.fw_manual = False              # firmware MANUAL latch (0x123 byte0 bit4)
+        self.fw_manual_since = None         # when the latch was last seen to rise
+        self.prev_estop = False
+        self.estop_clear_time = None        # when the E-Stop status last cleared
+        self.engage_start = None            # rclpy Time when /auto_engage began
+        self.control_mode = ''
 
         # ---------- ROS I/O ----------
         self.create_subscription(Twist, '/cmd_vel', self._cb_cmd_vel, 10)
         self.create_subscription(Bool, '/brake_cmd', self._cb_brake_cmd, 10)
+        self.create_subscription(Bool, '/auto_engage', self._cb_auto_engage, 10)
         self.create_subscription(Float32, '/servo_command', self._cb_brake_angle, 10)
         self.create_subscription(Float32, '/brake_angle_cmd', self._cb_brake_angle, 10)
         self.create_subscription(Float32, '/brake_servo_start_cmd', self._cb_servo_start, 10)
@@ -151,6 +170,7 @@ class RosCanBridge(Node):
         self.pub_brake_angle = self.create_publisher(Float32, '/brake_angle', 10)
         self.pub_servo_status = self.create_publisher(String, '/servo_status', 10)
         self.pub_fault       = self.create_publisher(Bool,   '/lowlevel_fault', 10)
+        self.pub_mode        = self.create_publisher(String, '/control_mode', 10)
 
         self.create_timer(1.0 / rate, self._control_loop)
         self._rx_thread.start()
@@ -169,6 +189,20 @@ class RosCanBridge(Node):
             state = 'active' if active else 'released'
             self.get_logger().info(f'manual /brake_cmd override {state}')
         self.manual_brake_active = active
+
+    def _cb_auto_engage(self, msg: Bool):
+        if msg.data:
+            self._request_engage()
+
+    def _request_engage(self):
+        self.get_logger().info('auto engage requested (speed_enable 0 -> 1)')
+        self.engage_start = self.get_clock().now()
+
+    def _set_mode(self, mode: str):
+        if mode != self.control_mode:
+            self.get_logger().info(f'control mode: {self.control_mode or "-"} -> {mode}')
+            self.control_mode = mode
+        self.pub_mode.publish(String(data=mode))
 
     def _cb_brake_angle(self, msg: Float32):
         angle = self._clamp_angle(msg.data)
@@ -198,12 +232,80 @@ class RosCanBridge(Node):
             self.last_board_stamp is None
             or (now - self.last_board_stamp).nanoseconds * 1e-9 > self.brd_to
         )
-        stop_required = self.estop_active or self.speed_fault_active or cmd_timeout or board_lost
-        self.pub_fault.publish(Bool(data=bool(stop_required)))
+        # E-Stop just released -> optionally re-arm AUTO by ourselves
+        if self.prev_estop and not self.estop_active:
+            self.estop_clear_time = now
+            if self.auto_resume_after_estop:
+                self._request_engage()
+        self.prev_estop = self.estop_active
+        # wait a moment after the E-Stop clears so a fresh 0x123 (MANUAL latch)
+        # arrives before we decide between MANUAL and AUTO
+        estop_settling = (self.estop_clear_time is not None
+                          and (now - self.estop_clear_time).nanoseconds * 1e-9 < 0.15)
+
+        # /auto_engage sequence: enable=0 for >= 60 ms and until the firmware's
+        # 300 ms re-arm hold-off (from the moment it latched MANUAL) is over,
+        # then enable=1 until the latch drops (or 1.5 s passes).
+        engage_phase = None
+        if self.engage_start is not None:
+            dt = (now - self.engage_start).nanoseconds * 1e-9
+            in_holdoff = (self.fw_manual_since is not None
+                          and (now - self.fw_manual_since).nanoseconds * 1e-9 < 0.4)
+            if self.estop_active or board_lost or dt > 1.5:
+                if self.fw_manual and not self.estop_active:
+                    self.get_logger().warn(
+                        'auto engage failed: firmware still MANUAL '
+                        '(accelerator pressed / not released for 1 s?)')
+                self.engage_start = None
+            elif estop_settling:
+                self.engage_start = now      # start the sequence after settling
+            elif dt < 0.06 or in_holdoff:
+                engage_phase = 'zero'
+            elif self.fw_manual:
+                engage_phase = 'one'
+            else:
+                self.engage_start = None
 
         # ---- step 4: สั่ง actuator ตาม condition ----
+        if self.estop_active or board_lost:
+            # rules 1, 3: หยุด + เบรก, steering ค้างมุมเดิม (ไม่ publish)
+            self._set_mode('ESTOP' if self.estop_active else 'NO_BOARD')
+            self.pub_fault.publish(Bool(data=True))
+            self._send_enable(0)
+            self._send_speed(0.0)
+            self._send_brake(1)
+            return
+
+        if estop_settling:
+            # just released: say nothing on 0x121/0x130 until the firmware's
+            # MANUAL latch is visible (keeps 0x120 alive for its timeout flag)
+            self.pub_fault.publish(Bool(data=True))
+            self._send_speed(0.0)
+            return
+
+        if engage_phase is not None:
+            self._set_mode('ENGAGING')
+            self.pub_fault.publish(Bool(data=False))
+            self._send_speed(0.0)
+            self._send_brake(0)
+            self._send_enable(0 if engage_phase == 'zero' else 1)
+            return
+
+        if self.fw_manual:
+            # rule 7: driver has the car. ไม่ส่ง 0x121 (เก็บ edge ไว้ให้ /auto_engage)
+            # และไม่ publish /steering_cmd -> steering_node ปล่อยพวงมาลัย
+            self._set_mode('MANUAL')
+            self.pub_fault.publish(Bool(data=False))
+            self._send_speed(0.0)
+            self._send_brake(0)
+            return
+
+        stop_required = self.speed_fault_active or cmd_timeout
+        self.pub_fault.publish(Bool(data=bool(stop_required)))
+        self._set_mode('AUTO')
+
         if stop_required:
-            # rules 1-3: หยุด + เบรก, steering ค้างมุมเดิม (ไม่ publish)
+            # rule 2: หยุด + เบรก, steering ค้างมุมเดิม (ไม่ publish)
             self._send_enable(0)
             self._send_speed(0.0)
             self._send_brake(1)
@@ -313,6 +415,10 @@ class RosCanBridge(Node):
                 d = bytes(msg.data)
                 input_flags = d[0]
                 output_flags = d[1]
+                fw_manual = bool(input_flags & 0x10)   # bp_version: takeover / post-E-Stop MANUAL
+                if fw_manual and not self.fw_manual:
+                    self.fw_manual_since = self.get_clock().now()
+                self.fw_manual = fw_manual
                 mcor_in_mv = struct.unpack_from('<H', d, 2)[0]
                 mcor_out_mv = struct.unpack_from('<H', d, 4)[0]
                 sensor_hz = struct.unpack_from('<H', d, 6)[0]
@@ -320,6 +426,7 @@ class RosCanBridge(Node):
                     f'fwd_input={bool(input_flags & 0x01)}, '
                     f'rev_input={bool(input_flags & 0x02)}, '
                     f'pedal_input={bool(input_flags & 0x04)}, '
+                    f'manual_latch={bool(input_flags & 0x10)}, '
                     f'fwd_output={bool(output_flags & 0x01)}, '
                     f'rev_output={bool(output_flags & 0x02)}, '
                     f'pedal_output={bool(output_flags & 0x04)}, '
@@ -385,7 +492,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

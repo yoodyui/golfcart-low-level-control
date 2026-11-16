@@ -15,6 +15,7 @@ ros_can_bridge:
     max_steering_deg: 50.0
     min_speed_for_steering_mps: 0.1
     brake_on_zero_cmd: false
+    auto_resume_after_estop: false # true = back to AUTO by itself when the E-Stop is released
 
 steering_node:
   ros__parameters:
