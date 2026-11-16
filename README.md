@@ -187,6 +187,7 @@ ros2 launch golfcart_low_level low_level.launch.py
 Useful status topics:
 
 ```bash
+ros2 topic echo /control_mode      # AUTO / MANUAL / ENGAGING / ESTOP / NO_BOARD
 ros2 topic echo /lowlevel_fault
 ros2 topic echo /e_stop_status
 ros2 topic echo /speed_status
@@ -211,6 +212,36 @@ Slow straight test, only when the vehicle is mechanically safe:
 ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist \
   "{linear: {x: 0.2}, angular: {z: 0.0}}"
 ```
+
+## MANUAL / AUTO / E-Stop (bp_version firmware)
+
+ใช้กับเฟิร์มแวร์ `firmware/stm32_motorbrake_car_shield_bp_version` ดูสถานะได้ที่
+`ros2 topic echo /control_mode`
+
+| เหตุการณ์ | ผล |
+|---|---|
+| กด E-Stop | เบรกดึง, ตัดคันเร่ง, หยุดรถ → `/control_mode = ESTOP` |
+| **ปล่อย E-Stop** | **เข้า MANUAL ทันที**: เบรกปล่อย, คันเร่งกลับมาที่คนขับ, มอเตอร์พวงมาลัยปล่อยให้หมุนด้วยมือ (แม้ nav ยังส่ง `/cmd_vel` อยู่) |
+| คนขับเหยียบคันเร่ง (ตอน AUTO หรือตอน bridge สั่งเบรกค้าง) | เข้า MANUAL เหมือนกัน |
+| ต้องการกลับ AUTO | ดูด้านล่าง |
+
+**กลับเข้า AUTO** (หลังปล่อย E-Stop หรือหลังคนขับเหยียบคันเร่ง):
+
+1. ปล่อยคันเร่งค้างไว้อย่างน้อย 1 วินาที
+2. สั่ง:
+
+   ```bash
+   ros2 topic pub --once /auto_engage std_msgs/msg/Bool "{data: true}"
+   ```
+
+3. `/control_mode` จะเปลี่ยน `MANUAL` → `ENGAGING` → `AUTO` แล้วรถวิ่งตาม `/cmd_vel` ต่อ
+   - ถ้ายังเป็น `MANUAL` และ log ขึ้น `auto engage failed` แปลว่ายังเหยียบคันเร่งอยู่
+     หรือปล่อยไม่ถึง 1 วินาที → ปล่อยคันเร่งแล้วสั่งใหม่
+
+ถ้าต้องการให้ปล่อย E-Stop แล้ว **กลับ AUTO เองโดยไม่ต้องสั่ง** ให้แก้
+`auto_resume_after_estop: true` ใน
+`ros2_ws/src/golfcart_low_level/config/golfcart_low_level.yaml` แล้ว `colcon build` ใหม่
+(ค่าเริ่มต้น `false` เพราะรถอาจออกตัวทันทีตาม `/cmd_vel` ที่ค้างอยู่)
 
 ## Brake Command Examples
 
@@ -254,7 +285,14 @@ More step-by-step brake test examples are in
 
 ## STM32 Firmware
 
-Open this STM32CubeIDE firmware project:
+Recommended project (manual/auto + E-Stop fixes, see its README and
+`CHANGES_BP.md`):
+
+```text
+firmware/stm32_motorbrake_car_shield_bp_version
+```
+
+The original project is kept for reference:
 
 ```text
 firmware/stm32_motorbrake_car_shield
@@ -278,7 +316,10 @@ accepts `0x130`, `0x132`, `0x120`, and `0x121`. The bit timing itself comes from
 the `.ioc`: `NominalPrescaler=40`, `NominalTimeSeg1=13`,
 `NominalTimeSeg2=3`, `NominalSyncJumpWidth=3`.
 
-E-stop behavior:
+E-stop behavior of the **original** `stm32_motorbrake_car_shield` project
+(bp_version is different: PC13 E-Stop button NC contact to GND, internal
+pull-up, pressed or wire cut = HIGH = E-Stop; see
+`docs/bp_version/estop_wiring.png`):
 
 ```text
 PD2 active-low, falling edge latches watchdog_status = 1
@@ -314,6 +355,11 @@ target_speed = 0
 brake_cmd = 1
 steering_node enters safe steering state
 ```
+
+With the bp_version firmware the bridge also follows the firmware MANUAL latch
+(after an E-Stop release or an accelerator press): brake released, no speed
+enable, no `/steering_cmd`, steering motor disabled, `/control_mode = MANUAL`,
+until `/auto_engage` is published.
 
 The e-stop must still be hardwired to the STM32 or vehicle safety circuit. The
 Jetson/ROS layer is supervision and command arbitration, not the only safety path.
