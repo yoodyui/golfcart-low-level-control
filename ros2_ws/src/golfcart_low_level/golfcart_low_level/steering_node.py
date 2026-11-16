@@ -34,7 +34,7 @@ import time
 import can
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float64
+from std_msgs.msg import Bool, Float64, String
 
 COUNTS_PER_MOTOR_REV = 10000.0     # position-mode resolution
 HB_DEG_PER_LSB = 1.0               # heartbeat angle resolution (deg of motor shaft)
@@ -90,12 +90,14 @@ class SteeringNode(Node):
         self.lowlevel_fault = True          # fail-safe until bridge reports healthy
         self.estop_active = True            # fail-safe until bridge reports healthy
         self.motor_enabled = False
+        self.manual_mode = False            # /control_mode == MANUAL -> always release the wheel
         self._fault_logged = False
 
         # ---------- ROS I/O ----------
         self.create_subscription(Float64, '/steering_cmd', self._cb_cmd, 10)
         self.create_subscription(Bool, '/lowlevel_fault', self._cb_lowlevel_fault, 10)
         self.create_subscription(Bool, '/e_stop_status', self._cb_estop, 10)
+        self.create_subscription(String, '/control_mode', self._cb_mode, 10)
         self.pub_angle = self.create_publisher(Float64, '/steering_angle', 10)
         self.pub_fault = self.create_publisher(Bool, '/steering_fault', 10)
 
@@ -127,6 +129,9 @@ class SteeringNode(Node):
     def _cb_estop(self, msg: Bool):
         self.estop_active = bool(msg.data)
 
+    def _cb_mode(self, msg: String):
+        self.manual_mode = (msg.data == 'MANUAL')
+
     # ================= TX =================
     def _tx_loop(self):
         now = time.monotonic()
@@ -144,6 +149,14 @@ class SteeringNode(Node):
             self._fault_logged = True
         elif not safe_required:
             self._fault_logged = False
+
+        if self.manual_mode:
+            # driver is steering: motor off regardless of disable_on_fault
+            if self.motor_enabled:
+                self._send_disable()
+                self.get_logger().info('MANUAL: steering motor disabled')
+            self.pub_fault.publish(Bool(data=False))
+            return
 
         if safe_required and self.disable_on_fault:
             if self.motor_enabled:
@@ -251,7 +264,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

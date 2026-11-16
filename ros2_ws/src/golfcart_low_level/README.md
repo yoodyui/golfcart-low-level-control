@@ -87,12 +87,33 @@ ros2 run golfcart_low_level ros_can_bridge
 ros2 run golfcart_low_level steering_node
 ```
 
+## MANUAL / AUTO / E-Stop (with bp_version firmware)
+
+`/control_mode` (`std_msgs/msg/String`) shows the state: `AUTO`, `MANUAL`,
+`ENGAGING`, `ESTOP` or `NO_BOARD`.
+
+- Driver presses the accelerator, or the E-Stop is released -> firmware latches
+  **MANUAL** (0x123 byte0 bit4). The bridge then sends brake=0, no speed
+  enable and no `/steering_cmd`; `steering_node` disables the KEYA motor so the
+  wheel turns by hand. A still-running `/cmd_vel` does **not** take the car back.
+- Back to AUTO (accelerator released for 1 s):
+
+  ```bash
+  ros2 topic pub --once /auto_engage std_msgs/msg/Bool "{data: true}"
+  ```
+
+- `auto_resume_after_estop: true` in `config/golfcart_low_level.yaml` makes the
+  bridge re-engage AUTO by itself right after the E-Stop is released.
+- Closing the bridge sends brake=1 as a fail-safe; press the accelerator (or
+  `cansend can0 130#00`) to release it when driving without ROS.
+
 ## Main Topics
 
 Inputs:
 
 - `/cmd_vel` (`geometry_msgs/msg/Twist`)
 - `/brake_cmd` (`std_msgs/msg/Bool`, manual brake override; `true = brake`, `false = return to /cmd_vel control`)
+- `/auto_engage` (`std_msgs/msg/Bool`, `true` = go back to AUTO after a driver takeover or E-Stop; accelerator must be released for 1 s)
 
 Internal bridge-to-steering command:
 

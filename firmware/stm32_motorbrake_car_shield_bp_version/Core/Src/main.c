@@ -265,6 +265,16 @@
  *        /speed_enable 0 -> 1 transition after the pedal has been released for
  *        TAKEOVER_REARM_MS (i.e. autonomy is explicitly restarted). */
 #define TAKEOVER_REARM_MS         1000u
+/* [BP-9] Releasing the E-Stop puts the car in MANUAL (same latch as a driver
+ *        takeover): throttle back to the pedal, brake released, ROS brake /
+ *        enable ignored, 0x123 bit4 set so the ROS bridge stops steering.
+ *        AUTO resumes only on a fresh /speed_enable 0 -> 1 edge (the bridge
+ *        sends one on /auto_engage). Before this, a still-running /cmd_vel
+ *        re-enabled AUTO the instant the button was released.
+ *        For REARM_HOLDOFF_MS after entering MANUAL every /speed_enable frame
+ *        is ignored, so stale enable=0/1 frames still in flight from the
+ *        bridge cannot fake the re-arm edge. */
+#define REARM_HOLDOFF_MS          300u
 
 /* [BP-3] /cmd_vel timeout handled on the STM32 itself: in AUTO with speed
  *        control enabled, no fresh 0x120 for SPEED_CMD_TIMEOUT_MS -> target 0
@@ -364,6 +374,7 @@ volatile uint8_t  mode_manual       = 1;  // 1 = MANUAL (PC9 HIGH), 0 = AUTO. Re
 volatile uint8_t  driver_takeover   = 0;  // 1 = driver pressed the accelerator; latched (see BP-2/8)
 volatile uint32_t pedal_released_since = 0; // [BP-8] tick the pedal was released (0 = pressed / unknown)
 volatile uint8_t  last_rx_enable    = 0;  // [BP-8] last /speed_enable value, for 0 -> 1 edge detection
+volatile uint32_t rearm_block_until = 0;  // [BP-9] ignore /speed_enable edges until this tick
 volatile uint8_t  cmd_timeout_brake = 0;  // 1 = AUTO + enabled + /cmd_vel stale -> braking (BP-3)
 volatile uint8_t  brake_oc_lockout  = 0;  // 1 = overcurrent tripped, brake re-engage blocked (BP-5)
 volatile uint8_t  wdi_kick_flag     = 0;  // set by TIM6, consumed by the main loop (BP-6)
@@ -534,6 +545,9 @@ int main(void)
 				} else if ((t - estop_clear_since) >= ESTOP_RELEASE_MS) {
 					estop_pc13 = 0;
 					estop_clear_since = 0;
+					driver_takeover = 1;   /* [BP-9] leave E-Stop in MANUAL */
+					last_rx_enable  = 1;   /* [BP-9] need a real 0 -> 1 edge to re-arm */
+					rearm_block_until = t + REARM_HOLDOFF_MS;
 				}
 			}
 		}
@@ -601,6 +615,8 @@ int main(void)
 				}
 				if ((now_ms - pedal_on_since) >= PEDAL_DEBOUNCE_MS) {
 					driver_takeover         = 1;
+					last_rx_enable          = 1;   /* [BP-9] continuous enable=1 cannot re-arm */
+					rearm_block_until       = now_ms + REARM_HOLDOFF_MS;
 					speed_control_enable    = 0;
 					curtis_speed_target_mps = 0.0f;
 				}
@@ -1177,9 +1193,10 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 			 * 50 Hz whenever cmd_vel is 0/stale). Only a 0 -> 1 edge with the
 			 * pedal released for TAKEOVER_REARM_MS re-arms AUTO. */
 			uint8_t en = (RxData[0] != 0u) ? 1u : 0u;
+			uint8_t holdoff = ((int32_t) (HAL_GetTick() - rearm_block_until) < 0) ? 1u : 0u; /* [BP-9] */
 			if (!en) {
 				speed_control_enable = 0;
-			} else if (!mode_manual) {
+			} else if (!mode_manual && !holdoff) {
 				if (driver_takeover && !last_rx_enable
 						&& pedal_released_since != 0u
 						&& (HAL_GetTick() - pedal_released_since) >= TAKEOVER_REARM_MS) {
@@ -1193,7 +1210,9 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 					speed_control_enable = 1;
 				}
 			}
-			last_rx_enable = en;
+			if (!holdoff) {
+				last_rx_enable = en;   /* [BP-9] stale frames during hold-off don't count */
+			}
 		} else if (RxHeader.Identifier == CAN_ID_SERVO_CMD) {
 			/* 8-byte: [0..3] start_deg, [4..7] stop_deg. Takes effect immediately;
 			 * the flash persist is debounced in the main loop (FLASH_WRITE_QUIET_MS). */
